@@ -161,7 +161,7 @@ INTERFACE_HTML = """
                  </div>
                  <p class="text-xs text-gray-500 mt-1">Click image for positional clicks.</p>
             </div>
-        </aside>
+            </aside>
     </main>
 
     <script>
@@ -195,6 +195,7 @@ INTERFACE_HTML = """
             socket.on('connect', () => {
                 console.log('Connected to server via WebSocket');
                 updateStatus('status-connecting', 'Connected to server, waiting for remote PC...');
+                // Request initial state if needed
             });
 
             socket.on('disconnect', () => {
@@ -210,6 +211,7 @@ INTERFACE_HTML = """
                 screenImage.src = 'https://placehold.co/1920x1080/555555/CCCCCC?text=Connection+Error';
             });
 
+            // Listen for client PC status updates
             socket.on('client_connected', (data) => {
                 console.log(data.message);
                 updateStatus('status-connected', 'Remote PC Connected');
@@ -222,64 +224,95 @@ INTERFACE_HTML = """
                 remoteScreenWidth = null; remoteScreenHeight = null;
             });
 
+            // Handle screen updates from the server
             socket.on('screen_update', (data) => {
                 const imageSrc = `data:image/jpeg;base64,${data.image}`;
                 screenImage.src = imageSrc;
+
+                // Auto-detect resolution from the first image received
                 if (remoteScreenWidth === null || remoteScreenHeight === null) {
-                    const checkDimensions = () => {
-                        if (screenImage.complete && screenImage.naturalWidth > 0) {
-                            if (remoteScreenWidth === null) { // Check again to avoid race condition
-                                remoteScreenWidth = screenImage.naturalWidth;
-                                remoteScreenHeight = screenImage.naturalHeight;
-                                console.log(`Remote screen resolution detected: ${remoteScreenWidth}x${remoteScreenHeight}`);
-                            }
-                        } else {
-                             // Image might not be fully loaded yet, retry shortly
-                             setTimeout(checkDimensions, 50);
-                        }
-                    };
-                    checkDimensions();
+                     // Use onload for more reliable dimension checking
+                     const tempImg = new Image();
+                     tempImg.onload = () => {
+                         if (remoteScreenWidth === null) { // Check again inside callback
+                             remoteScreenWidth = tempImg.naturalWidth;
+                             remoteScreenHeight = tempImg.naturalHeight;
+                             console.log(`Remote screen resolution detected: ${remoteScreenWidth}x${remoteScreenHeight}`);
+                         }
+                     };
+                     tempImg.onerror = () => {
+                         console.error("Error loading image to detect dimensions.");
+                     };
+                     tempImg.src = imageSrc; // Set src to trigger load
                 }
             });
 
+            // Handle errors sent from the server (e.g., client PC not connected)
             socket.on('command_error', (data) => {
                 console.error('Command Error:', data.message);
-                alert(`Command Error: ${data.message}`);
+                alert(`Command Error: ${data.message}`); // Simple alert for user feedback
             });
 
+            // --- Event Listeners for Controls ---
+
+            // Handle clicks on the screen image
             screenImage.addEventListener('click', (event) => {
-                if (!remoteScreenWidth || !remoteScreenHeight) return;
+                if (!remoteScreenWidth || !remoteScreenHeight) {
+                    console.warn("Remote screen dimensions not yet known. Click ignored.");
+                    return;
+                }
                 const rect = screenImage.getBoundingClientRect();
-                const x = event.clientX - rect.left;
+                const x = event.clientX - rect.left; // Click position relative to image element
                 const y = event.clientY - rect.top;
+
+                // Calculate corresponding coordinates on the remote screen
                 const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
                 const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
+
                 console.log(`Screen clicked: display(${x.toFixed(0)}, ${y.toFixed(0)}), remote(${remoteX}, ${remoteY})`);
-                const moveCommand = { action: 'move', x: remoteX, y: remoteY };
-                socket.emit('control_command', moveCommand);
+
+                // Optionally move first, then click (might feel more natural)
+                // const moveCommand = { action: 'move', x: remoteX, y: remoteY };
+                // socket.emit('control_command', moveCommand);
+                // console.log('Sent move command:', moveCommand);
+
+                // Show visual feedback on the interface
                 showClickFeedback(x, y);
+
+                // Send the click command with coordinates
                 const clickCommand = { action: 'click', button: 'left', x: remoteX, y: remoteY };
                 socket.emit('control_command', clickCommand);
                 console.log('Sent left click command:', clickCommand);
             });
 
+            // Handle right-clicks on the screen image
             screenImage.addEventListener('contextmenu', (event) => {
-                event.preventDefault();
-                if (!remoteScreenWidth || !remoteScreenHeight) return;
+                event.preventDefault(); // Prevent browser context menu
+                if (!remoteScreenWidth || !remoteScreenHeight) {
+                     console.warn("Remote screen dimensions not yet known. Right-click ignored.");
+                     return;
+                }
                 const rect = screenImage.getBoundingClientRect();
                 const x = event.clientX - rect.left;
                 const y = event.clientY - rect.top;
                 const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
                 const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
+
                 console.log(`Screen right-clicked: display(${x.toFixed(0)}, ${y.toFixed(0)}), remote(${remoteX}, ${remoteY})`);
-                const moveCommand = { action: 'move', x: remoteX, y: remoteY };
-                socket.emit('control_command', moveCommand);
-                showClickFeedback(x, y);
+
+                // Optionally move first
+                // const moveCommand = { action: 'move', x: remoteX, y: remoteY };
+                // socket.emit('control_command', moveCommand);
+                // console.log('Sent move command:', moveCommand);
+
+                showClickFeedback(x, y); // Use same feedback for right click
+
                 const clickCommand = { action: 'click', button: 'right', x: remoteX, y: remoteY };
                 socket.emit('control_command', clickCommand);
                 console.log('Sent right click command:', clickCommand);
             });
 
+            // Button clicks (without coordinates)
             leftClickBtn.addEventListener('click', () => {
                 socket.emit('control_command', { action: 'click', button: 'left' });
                 console.log('Sent left click command (button)');
@@ -290,20 +323,25 @@ INTERFACE_HTML = """
                 console.log('Sent right click command (button)');
             });
 
+            // Keyboard input handling
             keyboardInput.addEventListener('keypress', (event) => {
                 if (event.key === 'Enter') {
-                    event.preventDefault();
+                    event.preventDefault(); // Prevent form submission if inside one
                     const text = keyboardInput.value;
                     if (text) {
+                        // Send the whole string
                         const command = { action: 'keypress', key: text, is_string: true };
                         socket.emit('control_command', command);
                         console.log('Sent keypress command (string):', command);
-                        keyboardInput.value = '';
+                        keyboardInput.value = ''; // Clear the input field
                     }
                 }
+                // Could add handling for single key presses (non-Enter) if needed
             });
 
+            // Initial status
             updateStatus('status-connecting', 'Initializing...');
+
         }); // End DOMContentLoaded
     </script>
 </body>
@@ -317,39 +355,53 @@ def index():
         password = request.form.get('password')
         if check_auth(password):
             session['authenticated'] = True
+            print(f"Login successful for session: {request.sid}") # Log successful login
             return redirect(url_for('interface'))
         else:
+            print(f"Login failed for session: {request.sid}") # Log failed login
             return render_template_string(LOGIN_HTML, error="Invalid password")
 
+    # If already authenticated, redirect to interface
     if session.get('authenticated'):
         return redirect(url_for('interface'))
 
+    # Show login page for GET requests or if not authenticated
     return render_template_string(LOGIN_HTML)
 
 @app.route('/interface')
 def interface():
     if not session.get('authenticated'):
+        print(f"Unauthorized access attempt to /interface from {request.sid}") # Log unauthorized access
         return redirect(url_for('index'))
+    # User is authenticated, show the main interface
     return render_template_string(INTERFACE_HTML)
 
 @app.route('/logout')
 def logout():
+    print(f"Logging out session: {request.sid}") # Log logout action
     session.pop('authenticated', None)
     return redirect(url_for('index'))
 
 # --- SocketIO Events ---
 @socketio.on('connect')
 def handle_connect():
-    print(f"Client connected: {request.sid}")
-    # Further auth check happens when client/web interface identifies itself
+    # Note: Authentication for web interface happens via Flask session check in routes
+    # Authentication for client PC happens via 'register_client' event
+    print(f"Socket connected: {request.sid}")
+    # Check if a client PC is already connected and notify the new web interface
+    if client_pc_sid:
+        emit('client_connected', {'message': 'Remote PC already connected'}, room=request.sid)
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
     global client_pc_sid
-    print(f"Client disconnected: {request.sid}")
+    print(f"Socket disconnected: {request.sid}")
+    # Check if the disconnecting socket is the client PC
     if request.sid == client_pc_sid:
         print("Client PC disconnected.")
         client_pc_sid = None
+        # Notify all remaining web interfaces that the client PC is gone
         emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True, include_self=False)
 
 @socketio.on('register_client')
@@ -357,60 +409,109 @@ def handle_register_client(data):
     global client_pc_sid
     client_token = data.get('token')
     if client_token == ACCESS_PASSWORD:
+        # If a different client PC was already connected, disconnect it first
         if client_pc_sid and client_pc_sid != request.sid:
-             print(f"New client PC ({request.sid}), disconnecting old ({client_pc_sid}).")
-             socketio.disconnect(client_pc_sid, silent=True) # Disconnect previous client silently
+             print(f"New client PC ({request.sid}) detected, disconnecting old one ({client_pc_sid}).")
+             # Disconnect the old client; it will trigger the 'disconnect' event handler above
+             socketio.disconnect(client_pc_sid, silent=True) # silent=True might prevent disconnect handler, test needed. Let's keep it False.
+             # socketio.disconnect(client_pc_sid) # Disconnect generates a disconnect event
+
+        # Check if it's the same client PC re-registering (e.g., after network drop)
         elif client_pc_sid == request.sid:
              print(f"Client PC ({request.sid}) re-registered.")
+             # No need to change client_pc_sid
         else:
+             # This is the first time this client PC is registering in this session
              print(f"Client PC registered: {request.sid}")
 
+        # Store the new client PC's SID
         client_pc_sid = request.sid
-        # Notify web interfaces a client is ready
+        # Notify all connected web interfaces that a client PC is now ready
         emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True, include_self=False)
-        # Confirm registration to the client PC
+        # Send confirmation back specifically to the client PC that just registered
         emit('registration_success', room=request.sid)
     else:
-        print(f"Client PC authentication failed: {request.sid}")
+        # Authentication failed for the client PC trying to register
+        print(f"Client PC authentication failed for SID: {request.sid}")
         emit('registration_fail', {'message': 'Authentication failed'}, room=request.sid)
-        disconnect() # Disconnect the unauthorized client PC
+        # Disconnect this unauthorized client PC immediately
+        disconnect(request.sid)
 
+# --- MODIFIED FUNCTION ---
 @socketio.on('screen_data')
 def handle_screen_data(data):
+    # Ensure this function only processes data from the registered client PC
     if request.sid != client_pc_sid:
-        # print(f"Ignoring screen data from non-registered client: {request.sid}") # Can be noisy
+        # Silently ignore data if it's not from the registered client PC
+        # Adding logs here can be very noisy if other sockets try to send data
         return
 
-    image_data = data.get('image')
-    if image_data:
-        # Broadcast only to authenticated web interfaces (implicitly handled by session check on control_command)
-        # Here we broadcast to all connected sockets, JS handles display
-        emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
-    else:
-        print("Received empty screen data.")
+    try: # *** ADDED TRY BLOCK ***
+        image_data = data.get('image')
+        if image_data:
+            # *** TEMPORARILY COMMENT OUT BROADCAST FOR TESTING ***
+            # The line below sends the image to all web viewers. Comment it out
+            # to check if simply receiving the data works without disconnection.
+            # If the client stays connected with this commented out, the broadcast
+            # mechanism (or the load it creates) is the likely issue.
 
+            # emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
+
+            # Add a print statement to confirm data is being received successfully here
+            # Make this less verbose, maybe print only every N frames or on size change later
+            print(f"Received screen data from {request.sid}, size: {len(image_data)}. Broadcasting is currently DISABLED for testing.")
+
+        else:
+            # Log if empty data is received, which might indicate a client-side issue
+            print(f"Received empty screen data package from {request.sid}.")
+
+    except Exception as e: # *** ADDED EXCEPT BLOCK ***
+        # Log any error that occurs within this handler
+        print(f"!!! ERROR in handle_screen_data processing data from SID {request.sid}: {e}")
+        # Consider adding traceback for more detailed debugging:
+        # import traceback
+        # print(traceback.format_exc())
+        # Depending on the error, you might want to disconnect the client PC
+        # to prevent repeated errors, but be cautious with this.
+        # if client_pc_sid == request.sid:
+        #     print(f"Disconnecting client PC {request.sid} due to error in handle_screen_data.")
+        #     disconnect(request.sid)
 
 @socketio.on('control_command')
 def handle_control_command(data):
-    # Check if the sender is an authenticated web interface via session
+    # IMPORTANT: Verify the sender is an authenticated web interface using the Flask session
     if not session.get('authenticated'):
-        print(f"Unauthenticated control command from {request.sid}. Ignoring.")
-        return # Ignore command if the web user isn't logged in
+        print(f"Unauthenticated control command attempt from {request.sid}. Command ignored.")
+        # Optionally emit an error back to the sender, but might reveal info
+        # emit('command_error', {'message': 'Not authenticated'}, room=request.sid)
+        return # Crucial to stop processing unauthenticated commands
 
+    # If the web interface is authenticated, proceed to forward the command
     if client_pc_sid:
-        # print(f"Forwarding command to client PC ({client_pc_sid}): {data}") # Debug
-        # Emit the command specifically to the registered client PC
+        # Optional: Log the command being forwarded for debugging
+        # print(f"Forwarding command from web interface {request.sid} to client PC ({client_pc_sid}): {data}")
+        # Emit the command specifically to the registered client PC's room (socket ID)
         emit('command', data, room=client_pc_sid)
     else:
-        print("Control command received, but no client PC connected.")
+        # If no client PC is connected, inform the web interface that sent the command
+        print(f"Control command from {request.sid} received, but no client PC connected.")
         emit('command_error', {'message': 'Client PC not connected'}, room=request.sid) # Notify sender
 
 
 # --- Main Execution ---
 if __name__ == '__main__':
     print("Starting Flask-SocketIO server...")
-    # Use host='0.0.0.0' to be accessible externally
-    # Port 5000 is default for Flask, Render will assign one.
-    socketio.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
-    # For Render deployment, use: gunicorn --worker-class eventlet -w 1 app:app
-    # Set debug=False for production
+    # Get port from environment variable 'PORT' (used by Render, Heroku, etc.)
+    # Default to 5000 if 'PORT' is not set (for local development)
+    port = int(os.environ.get('PORT', 5000))
+    print(f"Server will run on host 0.0.0.0, port {port}")
+
+    # Run the SocketIO server using eventlet
+    # debug=True enables auto-reloading but should be False in production
+    # Use host='0.0.0.0' to make the server accessible externally (within network/internet)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+
+    # Note for Render deployment:
+    # Your Procfile should likely use gunicorn:
+    # web: gunicorn --worker-class eventlet -w 1 app:app
+    # Ensure 'gunicorn' and 'eventlet' are in your requirements.txt
