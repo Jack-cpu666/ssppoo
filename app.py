@@ -10,8 +10,8 @@ import traceback # For detailed error logging
 
 
 # --- Configuration ---
-SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_12345')
-ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too')
+SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', '@SKN@*&#))*(&HJHS)*(&)*H(&*&(HKH*&(&(^(*&(') # Change this 
+ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too') # password has to be the same in the client and server side
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -21,7 +21,6 @@ socketio = SocketIO(app, async_mode='eventlet', ping_timeout=20, ping_interval=1
 
 # --- Global Variables ---
 client_pc_sid = None
-# viewer_sids = set() # Optional: Store web viewer SIDs
 
 # --- Authentication ---
 def check_auth(password):
