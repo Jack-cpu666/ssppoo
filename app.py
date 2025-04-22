@@ -2,15 +2,17 @@
 # Flask web server with SocketIO, HTML, CSS, and JS embedded.
 # Includes direct keyboard event capture in the browser.
 
+# IMPORTANT: eventlet.monkey_patch() must be called before other imports
+# that might initialize sockets or threads (like Flask, SocketIO) to avoid issues.
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import base64
 from flask import Flask, request, session, redirect, url_for, render_template_string, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
-import eventlet # Required for async_mode='eventlet'
 import traceback # For detailed error logging
 
-# Use eventlet for async operations
-eventlet.monkey_patch()
 
 # --- Configuration ---
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_12345')
@@ -24,8 +26,7 @@ socketio = SocketIO(app, async_mode='eventlet', ping_timeout=20, ping_interval=1
 
 # --- Global Variables ---
 client_pc_sid = None
-# Store web viewer SIDs to send screen updates only to them (optional optimization)
-# viewer_sids = set() # Example if implementing targeted emits later
+# viewer_sids = set() # Optional: Store web viewer SIDs
 
 # --- Authentication ---
 def check_auth(password):
@@ -71,7 +72,6 @@ LOGIN_HTML = """
 </html>
 """
 
-# --- MODIFIED INTERFACE_HTML ---
 INTERFACE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -134,8 +134,7 @@ INTERFACE_HTML = """
                       onerror="this.onerror=null; this.src='https://placehold.co/600x338/333333/CCCCCC?text=Error+Loading+Screen';">
             </div>
         </div>
-
-        </main>
+    </main>
 
     <script>
         // Embedded JavaScript
@@ -151,13 +150,14 @@ INTERFACE_HTML = """
             let isShiftPressed = false;
             let isAltPressed = false;
 
-            // Make body focusable on load to capture keys immediately
              document.body.focus();
-             // Refocus body if user clicks elsewhere (e.g., the image)
-             document.addEventListener('click', () => {
-                 document.body.focus();
+             document.addEventListener('click', (e) => {
+                 // Only refocus body if the click is outside the image area,
+                 // otherwise image handlers should focus. Check if needed.
+                 if (e.target !== screenImage) {
+                    document.body.focus();
+                 }
              });
-
 
             function updateStatus(status, message) {
                 connectionStatusText.textContent = message;
@@ -165,13 +165,8 @@ INTERFACE_HTML = """
             }
 
             function showClickFeedback(x, y, elementRect) {
-                // Adjust position relative to the screenView container
-                const feedbackX = x + elementRect.left;
-                const feedbackY = y + elementRect.top;
-
                 const feedback = document.createElement('div');
                 feedback.className = 'click-feedback';
-                // Position feedback relative to the screenView div, not the image directly
                 feedback.style.left = `${x}px`; // Use click coords relative to image
                 feedback.style.top = `${y}px`;
                 screenView.appendChild(feedback);
@@ -199,7 +194,7 @@ INTERFACE_HTML = """
             socket.on('client_connected', (data) => {
                 console.log(data.message);
                 updateStatus('status-connected', 'Remote PC Connected');
-                 document.body.focus(); // Ensure body has focus when client connects
+                 document.body.focus();
             });
 
             socket.on('client_disconnected', (data) => {
@@ -211,11 +206,7 @@ INTERFACE_HTML = """
 
             socket.on('screen_update', (data) => {
                 const imageSrc = `data:image/jpeg;base64,${data.image}`;
-                // Only update src if it's different to potentially reduce flicker/reload
-                // This might be premature optimization, test if needed
-                // if (screenImage.src !== imageSrc) {
-                     screenImage.src = imageSrc;
-                // }
+                 screenImage.src = imageSrc;
 
                 if (remoteScreenWidth === null || remoteScreenHeight === null) {
                      const tempImg = new Image();
@@ -233,8 +224,6 @@ INTERFACE_HTML = """
 
             socket.on('command_error', (data) => {
                 console.error('Command Error:', data.message);
-                // Maybe display a less intrusive error message
-                // updateStatus('status-disconnected', `Error: ${data.message}`);
             });
 
             // --- Mouse Event Handling ---
@@ -245,10 +234,8 @@ INTERFACE_HTML = """
                 const y = event.clientY - rect.top;
                 const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
                 const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
-
                 const command = { action: 'move', x: remoteX, y: remoteY };
                 socket.emit('control_command', command);
-                // Debounce or throttle mouse move events if needed to reduce load
             });
 
             screenImage.addEventListener('click', (event) => {
@@ -258,13 +245,11 @@ INTERFACE_HTML = """
                 const y = event.clientY - rect.top;
                 const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
                 const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
-
-                // Send click command WITH coordinates
                 const clickCommand = { action: 'click', button: 'left', x: remoteX, y: remoteY };
                 socket.emit('control_command', clickCommand);
                 console.log('Sent left click command:', clickCommand);
-                showClickFeedback(x, y, rect); // Show feedback relative to image rect
-                 document.body.focus(); // Keep body focused
+                showClickFeedback(x, y, rect);
+                 document.body.focus();
             });
 
             screenImage.addEventListener('contextmenu', (event) => {
@@ -275,104 +260,81 @@ INTERFACE_HTML = """
                 const y = event.clientY - rect.top;
                 const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
                 const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
-
-                // Send right click command WITH coordinates
                 const clickCommand = { action: 'click', button: 'right', x: remoteX, y: remoteY };
                 socket.emit('control_command', clickCommand);
                 console.log('Sent right click command:', clickCommand);
-                showClickFeedback(x, y, rect); // Show feedback relative to image rect
-                 document.body.focus(); // Keep body focused
+                showClickFeedback(x, y, rect);
+                 document.body.focus();
             });
 
-             // --- Mouse Wheel Handling ---
              screenImage.addEventListener('wheel', (event) => {
-                event.preventDefault(); // Prevent page scroll
-                // Normalize scroll amount (browsers differ)
-                const deltaY = event.deltaY > 0 ? 1 : (event.deltaY < 0 ? -1 : 0); // Vertical scroll clicks
-                const deltaX = event.deltaX > 0 ? 1 : (event.deltaX < 0 ? -1 : 0); // Horizontal scroll clicks
-
+                event.preventDefault();
+                const deltaY = event.deltaY > 0 ? 1 : (event.deltaY < 0 ? -1 : 0);
+                const deltaX = event.deltaX > 0 ? 1 : (event.deltaX < 0 ? -1 : 0);
                 if (deltaY !== 0 || deltaX !== 0) {
                      const command = { action: 'scroll', dx: deltaX, dy: deltaY };
                      socket.emit('control_command', command);
                      console.log('Sent scroll command:', command);
                 }
-                 document.body.focus(); // Keep body focused
+                 document.body.focus();
             });
 
             // --- Keyboard Event Handling ---
             document.body.addEventListener('keydown', (event) => {
-                // Log the key event for debugging
                 console.log(`KeyDown: Key='${event.key}', Code='${event.code}', Ctrl=${event.ctrlKey}, Shift=${event.shiftKey}, Alt=${event.altKey}`);
+                if (event.key === 'Control') isControlPressed = true;
+                if (event.key === 'Shift') isShiftPressed = true;
+                if (event.key === 'Alt') isAltPressed = true;
 
-                // Basic check to prevent sending modifier keys themselves repeatedly
-                if (event.key === 'Control' || event.key === 'Shift' || event.key === 'Alt' || event.key === 'Meta') {
-                    if (event.key === 'Control') isControlPressed = true;
-                    if (event.key === 'Shift') isShiftPressed = true;
-                    if (event.key === 'Alt') isAltPressed = true;
-                    // Don't send modifier keydown events if you only care about them *with* other keys
-                    // return;
-                }
-
-                 // Prevent default browser behavior for keys we want to send
-                 // Be careful not to block essential browser functions unintentionally
-                if (event.key.length === 1 || event.key.startsWith('Arrow') || ['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown', 'Insert'].includes(event.key) || event.key.startsWith('F')) {
+                // Prevent default browser actions for many keys to ensure they reach the client
+                // This list might need adjustment based on testing
+                if (!event.metaKey && // Allow Meta (Win/Cmd) key combos for OS level actions
+                    (event.key.length === 1 || // Printable characters
+                     event.key.startsWith('Arrow') ||
+                     ['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown', 'Insert'].includes(event.key) ||
+                     event.key.startsWith('F')) // F1-F12 (might block browser F-keys)
+                   ) {
                      event.preventDefault();
                 }
-                 // Allow browser functions like Ctrl+C, Ctrl+V, Ctrl+R, F5 unless specifically handled
-                 // if (!(event.ctrlKey && ['c', 'v', 'x', 'a'].includes(event.key.toLowerCase())) && event.key !== 'F5' ) {
-                 //     event.preventDefault();
-                 // }
-
+                // Example: Allow Ctrl+C/V/X/R/T unless explicitly handled
+                if (event.ctrlKey && ['c', 'v', 'x', 'r', 't', 'w', 'l'].includes(event.key.toLowerCase())) {
+                    // Don't prevent default for common browser shortcuts
+                } else {
+                     // Prevent default for other potential conflicts if needed
+                }
 
                 const command = {
                     action: 'keydown',
-                    key: event.key,       // e.g., 'a', 'Enter', 'Shift'
-                    code: event.code,     // e.g., 'KeyA', 'Enter', 'ShiftLeft'
-                    ctrlKey: event.ctrlKey,
-                    shiftKey: event.shiftKey,
-                    altKey: event.altKey,
-                    metaKey: event.metaKey // Windows key / Command key
+                    key: event.key, code: event.code,
+                    ctrlKey: event.ctrlKey, shiftKey: event.shiftKey, altKey: event.altKey, metaKey: event.metaKey
                 };
                 socket.emit('control_command', command);
             });
 
             document.body.addEventListener('keyup', (event) => {
                 console.log(`KeyUp: Key='${event.key}', Code='${event.code}'`);
-
                  if (event.key === 'Control') isControlPressed = false;
                  if (event.key === 'Shift') isShiftPressed = false;
                  if (event.key === 'Alt') isAltPressed = false;
 
-                // Always send keyup events
-                const command = {
-                    action: 'keyup',
-                    key: event.key,
-                    code: event.code,
-                    // We don't usually need modifier states on keyup, but could include if needed
-                };
+                const command = { action: 'keyup', key: event.key, code: event.code };
                 socket.emit('control_command', command);
+
+                 // Optional: prevent default on keyup too if needed for specific keys
+                 if (event.key.startsWith('F')) { // Example: Prevent F-key up default if needed
+                      // event.preventDefault();
+                 }
             });
 
-             // Handle losing focus (e.g., browser tab change) - release modifiers
              window.addEventListener('blur', () => {
                  console.log('Window blurred - releasing potential modifier keys');
-                 if (isControlPressed) {
-                     socket.emit('control_command', { action: 'keyup', key: 'Control', code: 'ControlLeft' }); // Assume left?
-                     isControlPressed = false;
-                 }
-                  if (isShiftPressed) {
-                     socket.emit('control_command', { action: 'keyup', key: 'Shift', code: 'ShiftLeft' }); // Assume left?
-                     isShiftPressed = false;
-                 }
-                  if (isAltPressed) {
-                     socket.emit('control_command', { action: 'keyup', key: 'Alt', code: 'AltLeft' }); // Assume left?
-                     isAltPressed = false;
-                 }
+                 if (isControlPressed) { socket.emit('control_command', { action: 'keyup', key: 'Control', code: 'ControlLeft' }); isControlPressed = false; }
+                  if (isShiftPressed) { socket.emit('control_command', { action: 'keyup', key: 'Shift', code: 'ShiftLeft' }); isShiftPressed = false; }
+                  if (isAltPressed) { socket.emit('control_command', { action: 'keyup', key: 'Alt', code: 'AltLeft' }); isAltPressed = false; }
              });
 
-
             updateStatus('status-connecting', 'Initializing...');
-             document.body.focus(); // Try focusing body initially
+             document.body.focus();
 
         }); // End DOMContentLoaded
     </script>
@@ -387,10 +349,12 @@ def index():
         password = request.form.get('password')
         if check_auth(password):
             session['authenticated'] = True
-            print(f"Login successful for session: {request.sid}")
+            # --- FIXED --- Removed request.sid here
+            print("Login successful.")
             return redirect(url_for('interface'))
         else:
-            print(f"Login failed for session: {request.sid}")
+             # --- FIXED --- Removed request.sid here
+            print("Login failed.")
             return render_template_string(LOGIN_HTML, error="Invalid password")
 
     if session.get('authenticated'):
@@ -401,13 +365,14 @@ def index():
 @app.route('/interface')
 def interface():
     if not session.get('authenticated'):
-        print(f"Unauthorized access attempt to /interface from {request.sid}")
+        print(f"Unauthorized access attempt to /interface.") # Can add request IP if needed: request.remote_addr
         return redirect(url_for('index'))
     return render_template_string(INTERFACE_HTML)
 
 @app.route('/logout')
 def logout():
-    print(f"Logging out session: {request.sid}")
+     # --- FIXED --- Removed request.sid here
+    print("Logging out session.")
     session.pop('authenticated', None)
     return redirect(url_for('index'))
 
@@ -416,12 +381,10 @@ def logout():
 def handle_connect():
     sid = request.sid
     print(f"Socket connected: {sid}")
-    # Logic to differentiate viewers vs client PC could be added here if needed
-    # e.g., viewers could join a 'viewers' room
-    # if session.get('authenticated'): # Check if it's a web viewer connecting
+    # if session.get('authenticated'): # Example: Track viewers
     #     viewer_sids.add(sid)
     #     print(f"Web viewer connected: {sid}")
-    #     if client_pc_sid: # Inform new viewer if client is already connected
+    #     if client_pc_sid:
     #          emit('client_connected', {'message': 'Remote PC already connected'}, room=sid)
 
 @socketio.on('disconnect')
@@ -432,8 +395,8 @@ def handle_disconnect():
     if sid == client_pc_sid:
         print("Client PC disconnected.")
         client_pc_sid = None
-        emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True, include_self=False) # Notify all viewers
-    # else: # A web viewer disconnected
+        emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True, include_self=False)
+    # else: # Example: Track viewers
     #     viewer_sids.discard(sid)
     #     print(f"Web viewer disconnected: {sid}")
 
@@ -446,61 +409,50 @@ def handle_register_client(data):
     if client_token == ACCESS_PASSWORD:
         if client_pc_sid and client_pc_sid != sid:
              print(f"New client PC ({sid}) detected, disconnecting old one ({client_pc_sid}).")
-             socketio.disconnect(client_pc_sid) # Triggers disconnect handler
+             socketio.disconnect(client_pc_sid)
         elif client_pc_sid == sid:
              print(f"Client PC ({sid}) re-registered.")
         else:
              print(f"Client PC registered: {sid}")
 
         client_pc_sid = sid
-        emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True, include_self=False) # Notify viewers
-        emit('registration_success', room=sid) # Confirm to client
+        emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True, include_self=False)
+        emit('registration_success', room=sid)
     else:
         print(f"Client PC authentication failed for SID: {sid}")
         emit('registration_fail', {'message': 'Authentication failed'}, room=sid)
         disconnect(sid)
 
-# --- MODIFIED FUNCTION ---
 @socketio.on('screen_data')
 def handle_screen_data(data):
-    # Only process data from the registered client PC
     if request.sid != client_pc_sid:
         return
 
     try:
         image_data = data.get('image')
         if image_data:
-            # *** RE-ENABLED BROADCAST ***
-            # Send screen update to all connected sockets (viewers)
-            # Optimization: Could send only to SIDs in viewer_sids if tracking them
+            # Re-enabled broadcast
             emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
-
-            # Reduce logging frequency - maybe log only periodically or on errors
-            # print(f"Sent screen update. Size: {len(image_data)}")
-
-        # else: # Log if empty data is received (might indicate client issue)
+        # Reduce logging
+        # else:
         #     print(f"Received empty screen data package from {request.sid}.")
 
     except Exception as e:
         print(f"!!! ERROR in handle_screen_data processing data from SID {request.sid}: {e}")
-        print(traceback.format_exc()) # Print full traceback for errors
+        print(traceback.format_exc())
 
 
 @socketio.on('control_command')
 def handle_control_command(data):
     sid = request.sid
-    # Verify sender is authenticated web interface *OR* potentially allow other authenticated sources later
+    # Allow commands only from authenticated web sessions
     if not session.get('authenticated'):
-        print(f"Unauthenticated control command attempt from {sid}. Ignoring.")
+        # print(f"Unauthenticated control command attempt from {sid}. Ignoring.") # Optional logging
         return
 
     if client_pc_sid:
-        # Forward the command (move, click, keydown, keyup, scroll) to the client PC
         emit('command', data, room=client_pc_sid)
-        # Optional: Log commands for debugging, but can be very verbose
-        # print(f"Forwarding command from {sid} to {client_pc_sid}: {data.get('action')}")
     else:
-        # Inform the sender if the client PC isn't available
         emit('command_error', {'message': 'Client PC not connected'}, room=sid)
 
 
@@ -509,7 +461,7 @@ if __name__ == '__main__':
     print("Starting Flask-SocketIO server...")
     port = int(os.environ.get('PORT', 5000))
     print(f"Server will run on host 0.0.0.0, port {port}")
-    print(f"Access password: {'*' * len(ACCESS_PASSWORD) if ACCESS_PASSWORD else 'None'}")
+    print(f"Access password configured: {'Yes' if ACCESS_PASSWORD else 'No'}")
 
-    # Use Gunicorn for production on Render: gunicorn --worker-class eventlet -w 1 app:app
+    # Recommended for Render: gunicorn --worker-class eventlet -w 1 app:app
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
