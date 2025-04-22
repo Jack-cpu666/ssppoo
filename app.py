@@ -309,7 +309,7 @@ def handle_register_client(data):
     if client_token == ACCESS_PASSWORD:
         if client_pc_sid and client_pc_sid != sid:
              print(f"New client PC ({sid}) detected, disconnecting old one ({client_pc_sid}).")
-             socketio.disconnect(client_pc_sid)
+             disconnect(client_pc_sid)
         elif client_pc_sid == sid:
              print(f"Client PC ({sid}) re-registered.")
         else:
