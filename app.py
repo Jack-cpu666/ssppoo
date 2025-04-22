@@ -1,9 +1,4 @@
-# Consolidated Server (app.py)
-# Flask web server with SocketIO, HTML, CSS, and JS embedded.
-# Includes direct keyboard event capture in the browser.
 
-# IMPORTANT: eventlet.monkey_patch() must be called before other imports
-# that might initialize sockets or threads (like Flask, SocketIO) to avoid issues.
 import eventlet
 eventlet.monkey_patch()
 
