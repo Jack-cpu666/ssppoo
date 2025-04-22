@@ -6,24 +6,36 @@ import base64
 from flask import Flask, request, session, redirect, url_for, render_template_string, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 import eventlet # Required for async_mode='eventlet'
-
 # Use eventlet for async operations
+# !!! IMPORTANT: This MUST be called before importing Flask or SocketIO !!!
 eventlet.monkey_patch()
 
+
 # --- Configuration ---
-SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_12345')
-ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too')
+# Use environment variables for secrets; provide defaults for local testing if needed.
+# !! Ensure strong, unique values are set in your production environment !!
+SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_12345_local_dev')
+ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too_local_dev')
 
 # --- Flask App Setup ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = SECRET_KEY
+# Consider adding configuration for session cookie security (HttpOnly, Secure in production)
+# app.config['SESSION_COOKIE_SECURE'] = True # Enable if using HTTPS
+# app.config['SESSION_COOKIE_HTTPONLY'] = True
+# app.config['SESSION_COOKIE_SAMESITE'] = 'Lax' # Or 'Strict'
+
 socketio = SocketIO(app, async_mode='eventlet')
 
 # --- Global Variables ---
+# Stores the SocketIO SID of the currently connected and registered client PC
 client_pc_sid = None
 
 # --- Authentication ---
 def check_auth(password):
+    """Checks if the provided password matches the access password."""
+    # Use a more secure comparison method if possible in high-security scenarios,
+    # though for this use case, direct comparison might be acceptable.
     return password == ACCESS_PASSWORD
 
 # --- HTML Templates (as strings) ---
@@ -94,7 +106,7 @@ INTERFACE_HTML = """
         #screen-view {
             width: 100%;
             overflow: hidden;
-            position: relative;
+            position: relative; /* Needed for absolute positioning of click feedback */
         }
         .status-dot {
             height: 10px;
@@ -156,8 +168,8 @@ INTERFACE_HTML = """
             <div>
                  <label class="block text-sm font-medium text-gray-600 mb-1">Mouse Clicks</label>
                  <div class="grid grid-cols-2 gap-2">
-                     <button id="left-click-btn" class="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-md text-sm">Left Click</button>
-                     <button id="right-click-btn" class="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-md text-sm">Right Click</button>
+                      <button id="left-click-btn" class="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-md text-sm">Left Click</button>
+                      <button id="right-click-btn" class="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-md text-sm">Right Click</button>
                  </div>
                  <p class="text-xs text-gray-500 mt-1">Click image for positional clicks.</p>
             </div>
@@ -195,7 +207,8 @@ INTERFACE_HTML = """
             socket.on('connect', () => {
                 console.log('Connected to server via WebSocket');
                 updateStatus('status-connecting', 'Connected to server, waiting for remote PC...');
-                // Request initial state if needed
+                // Request initial state if needed (e.g., ask server if client is already connected)
+                // socket.emit('request_client_status'); // Example custom event
             });
 
             socket.on('disconnect', () => {
@@ -230,20 +243,22 @@ INTERFACE_HTML = """
                 screenImage.src = imageSrc;
 
                 // Auto-detect resolution from the first image received
+                // This logic seems fine, using an intermediate image object for dimensions
                 if (remoteScreenWidth === null || remoteScreenHeight === null) {
-                     // Use onload for more reliable dimension checking
-                     const tempImg = new Image();
-                     tempImg.onload = () => {
-                         if (remoteScreenWidth === null) { // Check again inside callback
-                             remoteScreenWidth = tempImg.naturalWidth;
-                             remoteScreenHeight = tempImg.naturalHeight;
-                             console.log(`Remote screen resolution detected: ${remoteScreenWidth}x${remoteScreenHeight}`);
-                         }
-                     };
-                     tempImg.onerror = () => {
-                         console.error("Error loading image to detect dimensions.");
-                     };
-                     tempImg.src = imageSrc; // Set src to trigger load
+                    const tempImg = new Image();
+                    tempImg.onload = () => {
+                        if (remoteScreenWidth === null) { // Check again inside callback in case of race condition
+                            remoteScreenWidth = tempImg.naturalWidth;
+                            remoteScreenHeight = tempImg.naturalHeight;
+                            console.log(`Remote screen resolution detected: ${remoteScreenWidth}x${remoteScreenHeight}`);
+                        }
+                    };
+                    tempImg.onerror = () => {
+                        console.error("Error loading image to detect dimensions.");
+                        // Reset placeholder if needed
+                        // screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=Error+Reading+Screen+Dimensions';
+                    };
+                    tempImg.src = imageSrc; // Set src to trigger load
                 }
             });
 
@@ -271,11 +286,6 @@ INTERFACE_HTML = """
 
                 console.log(`Screen clicked: display(${x.toFixed(0)}, ${y.toFixed(0)}), remote(${remoteX}, ${remoteY})`);
 
-                // Optionally move first, then click (might feel more natural)
-                // const moveCommand = { action: 'move', x: remoteX, y: remoteY };
-                // socket.emit('control_command', moveCommand);
-                // console.log('Sent move command:', moveCommand);
-
                 // Show visual feedback on the interface
                 showClickFeedback(x, y);
 
@@ -300,11 +310,6 @@ INTERFACE_HTML = """
 
                 console.log(`Screen right-clicked: display(${x.toFixed(0)}, ${y.toFixed(0)}), remote(${remoteX}, ${remoteY})`);
 
-                // Optionally move first
-                // const moveCommand = { action: 'move', x: remoteX, y: remoteY };
-                // socket.emit('control_command', moveCommand);
-                // console.log('Sent move command:', moveCommand);
-
                 showClickFeedback(x, y); // Use same feedback for right click
 
                 const clickCommand = { action: 'click', button: 'right', x: remoteX, y: remoteY };
@@ -312,7 +317,7 @@ INTERFACE_HTML = """
                 console.log('Sent right click command:', clickCommand);
             });
 
-            // Button clicks (without coordinates)
+            // Button clicks (without coordinates - clicks at current cursor position on remote)
             leftClickBtn.addEventListener('click', () => {
                 socket.emit('control_command', { action: 'click', button: 'left' });
                 console.log('Sent left click command (button)');
@@ -351,150 +356,155 @@ INTERFACE_HTML = """
 # --- Flask Routes ---
 @app.route('/', methods=['GET', 'POST'])
 def index():
+    """Handles login attempts and shows the login page."""
     if request.method == 'POST':
         password = request.form.get('password')
         if check_auth(password):
             session['authenticated'] = True
-            print(f"Login successful for session: {request.sid}") # Log successful login
+            # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
+            print(f"Login successful for user at: {request.remote_addr}") # Log successful login
             return redirect(url_for('interface'))
         else:
-            print(f"Login failed for session: {request.sid}") # Log failed login
+            # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
+            print(f"Login failed for user at: {request.remote_addr}") # Log failed login
             return render_template_string(LOGIN_HTML, error="Invalid password")
 
-    # If already authenticated, redirect to interface
+    # If already authenticated (e.g., user refreshes page), redirect to interface
     if session.get('authenticated'):
         return redirect(url_for('interface'))
 
-    # Show login page for GET requests or if not authenticated
+    # Show login page for GET requests or if authentication fails
     return render_template_string(LOGIN_HTML)
 
 @app.route('/interface')
 def interface():
+    """Shows the main remote control interface if authenticated."""
     if not session.get('authenticated'):
-        print(f"Unauthorized access attempt to /interface from {request.sid}") # Log unauthorized access
+        # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
+        print(f"Unauthorized access attempt to /interface from {request.remote_addr}") # Log unauthorized access
         return redirect(url_for('index'))
     # User is authenticated, show the main interface
     return render_template_string(INTERFACE_HTML)
 
 @app.route('/logout')
 def logout():
-    print(f"Logging out session: {request.sid}") # Log logout action
+    """Logs the user out by clearing the session."""
+    # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
+    print(f"Logging out user from: {request.remote_addr}") # Log logout action
     session.pop('authenticated', None)
     return redirect(url_for('index'))
 
 # --- SocketIO Events ---
 @socketio.on('connect')
 def handle_connect():
-    # Note: Authentication for web interface happens via Flask session check in routes
-    # Authentication for client PC happens via 'register_client' event
-    print(f"Socket connected: {request.sid}")
-    # Check if a client PC is already connected and notify the new web interface
+    """Handles new SocketIO connections (both web interface and potentially client PC)."""
+    # Note: Authentication for web interface happens via Flask session check in routes.
+    # Authentication for client PC happens via 'register_client' event below.
+    print(f"Socket connected: {request.sid}") # request.sid IS valid here in SocketIO handler
+    # Check if a client PC is already connected and notify the new web interface connection
     if client_pc_sid:
         emit('client_connected', {'message': 'Remote PC already connected'}, room=request.sid)
+    else:
+        # Optionally notify that the client PC is not yet connected
+        emit('client_disconnected', {'message': 'Remote PC not connected yet'}, room=request.sid)
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    """Handles SocketIO disconnections."""
     global client_pc_sid
     print(f"Socket disconnected: {request.sid}")
-    # Check if the disconnecting socket is the client PC
+    # Check if the disconnecting socket IS the registered client PC
     if request.sid == client_pc_sid:
-        print("Client PC disconnected.")
+        print(f"Client PC ({request.sid}) disconnected.")
         client_pc_sid = None
-        # Notify all remaining web interfaces that the client PC is gone
-        emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True, include_self=False)
+        # Notify all connected web interfaces that the client PC is gone
+        # broadcast=True sends to all clients EXCEPT the sender (who is disconnecting anyway)
+        emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True)
 
 @socketio.on('register_client')
 def handle_register_client(data):
+    """Handles the registration attempt from the client PC."""
     global client_pc_sid
-    client_token = data.get('token')
+    client_token = data.get('token') # Client PC should send its password as 'token'
+
     if client_token == ACCESS_PASSWORD:
-        # If a different client PC was already connected, disconnect it first
+        print(f"Client PC registration attempt from {request.sid}...")
+        # If a *different* client PC was already connected, disconnect it first.
         if client_pc_sid and client_pc_sid != request.sid:
-             print(f"New client PC ({request.sid}) detected, disconnecting old one ({client_pc_sid}).")
-             # Disconnect the old client; it will trigger the 'disconnect' event handler above
-             socketio.disconnect(client_pc_sid, silent=True) # silent=True might prevent disconnect handler, test needed. Let's keep it False.
-             # socketio.disconnect(client_pc_sid) # Disconnect generates a disconnect event
+             print(f"New client PC ({request.sid}) connecting, disconnecting old one ({client_pc_sid}).")
+             # Trigger the 'disconnect' handler for the old client
+             socketio.disconnect(client_pc_sid) # Default silent=False is good here
 
-        # Check if it's the same client PC re-registering (e.g., after network drop)
-        elif client_pc_sid == request.sid:
-             print(f"Client PC ({request.sid}) re-registered.")
-             # No need to change client_pc_sid
-        else:
-             # This is the first time this client PC is registering in this session
-             print(f"Client PC registered: {request.sid}")
-
-        # Store the new client PC's SID
+        # Whether it's new or the same one re-registering, store its SID
         client_pc_sid = request.sid
+        print(f"Client PC registered successfully: {client_pc_sid}")
+
         # Notify all connected web interfaces that a client PC is now ready
-        emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True, include_self=False)
+        emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True)
         # Send confirmation back specifically to the client PC that just registered
-        emit('registration_success', room=request.sid)
+        emit('registration_success', {'message': 'Registration successful'}, room=request.sid)
     else:
         # Authentication failed for the client PC trying to register
-        print(f"Client PC authentication failed for SID: {request.sid}")
+        print(f"Client PC authentication failed for SID: {request.sid}. Token received: '{client_token}'")
         emit('registration_fail', {'message': 'Authentication failed'}, room=request.sid)
         # Disconnect this unauthorized client PC immediately
-        disconnect(request.sid)
+        disconnect(request.sid) # disconnect() is a Flask-SocketIO function
 
-# --- MODIFIED FUNCTION ---
 @socketio.on('screen_data')
 def handle_screen_data(data):
-    # Ensure this function only processes data from the registered client PC
+    """Receives screen data from the client PC and broadcasts it to web interfaces."""
+    # Ensure this function only processes data from the *currently registered* client PC
     if request.sid != client_pc_sid:
-        # Silently ignore data if it's not from the registered client PC
-        # Adding logs here can be very noisy if other sockets try to send data
+        # Silently ignore data if it's not from the registered client PC.
+        # Logging here can be very noisy if other sockets somehow send this event.
+        # print(f"Ignoring screen_data from non-client SID: {request.sid}")
         return
 
-    try: # *** ADDED TRY BLOCK ***
+    try:
         image_data = data.get('image')
         if image_data:
-            # *** TEMPORARILY COMMENT OUT BROADCAST FOR TESTING ***
-            # The line below sends the image to all web viewers. Comment it out
-            # to check if simply receiving the data works without disconnection.
-            # If the client stays connected with this commented out, the broadcast
-            # mechanism (or the load it creates) is the likely issue.
+            # *** RE-ENABLED BROADCAST ***
+            # Send the image data to all connected web interfaces
+            emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
 
-            # emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
-
-            # Add a print statement to confirm data is being received successfully here
-            # Make this less verbose, maybe print only every N frames or on size change later
-            print(f"Received screen data from {request.sid}, size: {len(image_data)}. Broadcasting is currently DISABLED for testing.")
+            # Optional: Reduce logging frequency for performance
+            # import time
+            # if not hasattr(handle_screen_data, 'last_log_time') or time.time() - handle_screen_data.last_log_time > 5:
+            #     print(f"Received and broadcast screen data from {request.sid}, size: {len(image_data)} bytes.")
+            #     handle_screen_data.last_log_time = time.time()
 
         else:
-            # Log if empty data is received, which might indicate a client-side issue
-            print(f"Received empty screen data package from {request.sid}.")
+            print(f"Received empty screen data package from client PC {request.sid}.")
 
-    except Exception as e: # *** ADDED EXCEPT BLOCK ***
-        # Log any error that occurs within this handler
+    except Exception as e:
         print(f"!!! ERROR in handle_screen_data processing data from SID {request.sid}: {e}")
-        # Consider adding traceback for more detailed debugging:
+        # Consider adding full traceback for debugging:
         # import traceback
         # print(traceback.format_exc())
-        # Depending on the error, you might want to disconnect the client PC
-        # to prevent repeated errors, but be cautious with this.
+        # Optionally disconnect the client if errors persist, but be cautious
         # if client_pc_sid == request.sid:
         #     print(f"Disconnecting client PC {request.sid} due to error in handle_screen_data.")
         #     disconnect(request.sid)
 
 @socketio.on('control_command')
 def handle_control_command(data):
-    # IMPORTANT: Verify the sender is an authenticated web interface using the Flask session
+    """Receives control commands from an authenticated web interface and forwards to the client PC."""
+    # IMPORTANT: Verify the sender is an *authenticated web interface* using the Flask session
     if not session.get('authenticated'):
         print(f"Unauthenticated control command attempt from {request.sid}. Command ignored.")
-        # Optionally emit an error back to the sender, but might reveal info
+        # Optionally emit an error back, but this might reveal authentication status
         # emit('command_error', {'message': 'Not authenticated'}, room=request.sid)
-        return # Crucial to stop processing unauthenticated commands
+        return # Stop processing unauthenticated commands
 
-    # If the web interface is authenticated, proceed to forward the command
+    # If the web interface is authenticated, proceed
     if client_pc_sid:
-        # Optional: Log the command being forwarded for debugging
-        # print(f"Forwarding command from web interface {request.sid} to client PC ({client_pc_sid}): {data}")
-        # Emit the command specifically to the registered client PC's room (socket ID)
+        # Forward the command specifically to the registered client PC
+        # print(f"Forwarding command from web {request.sid} to client PC ({client_pc_sid}): {data}") # Debug log
         emit('command', data, room=client_pc_sid)
     else:
-        # If no client PC is connected, inform the web interface that sent the command
-        print(f"Control command from {request.sid} received, but no client PC connected.")
+        # No client PC is connected to receive the command
+        print(f"Control command from web {request.sid} received, but no client PC connected.")
         emit('command_error', {'message': 'Client PC not connected'}, room=request.sid) # Notify sender
 
 
@@ -504,14 +514,24 @@ if __name__ == '__main__':
     # Get port from environment variable 'PORT' (used by Render, Heroku, etc.)
     # Default to 5000 if 'PORT' is not set (for local development)
     port = int(os.environ.get('PORT', 5000))
-    print(f"Server will run on host 0.0.0.0, port {port}")
+    # Host '0.0.0.0' makes the server accessible externally (important for Render)
+    host = '0.0.0.0'
+    print(f"Server starting on host {host}, port {port}")
 
     # Run the SocketIO server using eventlet
-    # debug=True enables auto-reloading but should be False in production
-    # Use host='0.0.0.0' to make the server accessible externally (within network/internet)
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    # debug=False is crucial for production and when using eventlet/gevent workers
+    # Gunicorn will manage workers; this block is mainly for local `python app.py` execution
+    try:
+        socketio.run(app, host=host, port=port, debug=False)
+    except KeyboardInterrupt:
+        print("Server shutting down.")
+    except Exception as e:
+        print(f"Failed to start server: {e}")
+
 
     # Note for Render deployment:
-    # Your Procfile should likely use gunicorn:
+    # Your Render 'Start Command' should typically use gunicorn:
     # web: gunicorn --worker-class eventlet -w 1 app:app
-    # Ensure 'gunicorn' and 'eventlet' are in your requirements.txt
+    # Ensure 'gunicorn' and 'eventlet' are listed in your requirements.txt file.
+    # The '-w 1' (1 worker) is often recommended with SocketIO and eventlet/gevent
+    # to simplify state management, but adjust based on load testing if needed.
