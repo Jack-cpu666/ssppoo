@@ -1,41 +1,34 @@
 # Consolidated Server (app.py)
 # Flask web server with SocketIO, HTML, CSS, and JS embedded.
+# Includes direct keyboard event capture in the browser.
 
 import os
 import base64
 from flask import Flask, request, session, redirect, url_for, render_template_string, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 import eventlet # Required for async_mode='eventlet'
+import traceback # For detailed error logging
+
 # Use eventlet for async operations
-# !!! IMPORTANT: This MUST be called before importing Flask or SocketIO !!!
 eventlet.monkey_patch()
 
-
 # --- Configuration ---
-# Use environment variables for secrets; provide defaults for local testing if needed.
-# !! Ensure strong, unique values are set in your production environment !!
-SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_12345_local_dev')
-ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too_local_dev')
+SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_12345')
+ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too')
 
 # --- Flask App Setup ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = SECRET_KEY
-# Consider adding configuration for session cookie security (HttpOnly, Secure in production)
-# app.config['SESSION_COOKIE_SECURE'] = True # Enable if using HTTPS
-# app.config['SESSION_COOKIE_HTTPONLY'] = True
-# app.config['SESSION_COOKIE_SAMESITE'] = 'Lax' # Or 'Strict'
-
-socketio = SocketIO(app, async_mode='eventlet')
+# Increase ping timeout/interval for potentially less stable connections
+socketio = SocketIO(app, async_mode='eventlet', ping_timeout=20, ping_interval=10)
 
 # --- Global Variables ---
-# Stores the SocketIO SID of the currently connected and registered client PC
 client_pc_sid = None
+# Store web viewer SIDs to send screen updates only to them (optional optimization)
+# viewer_sids = set() # Example if implementing targeted emits later
 
 # --- Authentication ---
 def check_auth(password):
-    """Checks if the provided password matches the access password."""
-    # Use a more secure comparison method if possible in high-security scenarios,
-    # though for this use case, direct comparison might be acceptable.
     return password == ACCESS_PASSWORD
 
 # --- HTML Templates (as strings) ---
@@ -78,6 +71,7 @@ LOGIN_HTML = """
 </html>
 """
 
+# --- MODIFIED INTERFACE_HTML ---
 INTERFACE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -90,7 +84,9 @@ INTERFACE_HTML = """
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         /* Embedded CSS */
-        body {
+        html, body {
+            height: 100%;
+            overflow: hidden; /* Prevent body scrollbars */
             font-family: 'Inter', sans-serif;
             margin: 0;
             padding: 0;
@@ -98,117 +94,93 @@ INTERFACE_HTML = """
         }
         #screen-view img {
             max-width: 100%;
-            height: auto;
+            max-height: 100%; /* Ensure image stays within container */
+            height: auto; /* Maintain aspect ratio */
+            width: auto; /* Maintain aspect ratio */
             display: block;
             cursor: crosshair;
             background-color: #333; /* Placeholder background */
+            object-fit: contain; /* Scale image down to fit */
         }
         #screen-view {
             width: 100%;
+            height: 100%; /* Fill available space */
             overflow: hidden;
-            position: relative; /* Needed for absolute positioning of click feedback */
+            position: relative; /* For click feedback positioning */
+            display: flex; /* Center image */
+            align-items: center; /* Center image */
+            justify-content: center; /* Center image */
         }
-        .status-dot {
-            height: 10px;
-            width: 10px;
-            border-radius: 50%;
-            display: inline-block;
-            margin-right: 5px;
-        }
+        .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; margin-right: 5px; }
         .status-connected { background-color: #4ade80; } /* green-400 */
         .status-disconnected { background-color: #f87171; } /* red-400 */
         .status-connecting { background-color: #fbbf24; } /* amber-400 */
 
-        .click-feedback {
-            position: absolute;
-            border: 2px solid red;
-            border-radius: 50%;
-            width: 20px;
-            height: 20px;
-            transform: translate(-50%, -50%) scale(0);
-            pointer-events: none;
-            background-color: rgba(255, 0, 0, 0.3);
-            animation: click-pulse 0.4s ease-out forwards;
-        }
-        @keyframes click-pulse {
-            0% { transform: translate(-50%, -50%) scale(0.5); opacity: 1; }
-            100% { transform: translate(-50%, -50%) scale(2); opacity: 0; }
-        }
+        .click-feedback { position: absolute; border: 2px solid red; border-radius: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%) scale(0); pointer-events: none; background-color: rgba(255, 0, 0, 0.3); animation: click-pulse 0.4s ease-out forwards; }
+        @keyframes click-pulse { 0% { transform: translate(-50%, -50%) scale(0.5); opacity: 1; } 100% { transform: translate(-50%, -50%) scale(2); opacity: 0; } }
+        /* Focus outline removed for body to prevent blue box on click */
+        body:focus { outline: none; }
     </style>
 </head>
-<body class="bg-gray-200 flex flex-col h-screen">
-
-    <header class="bg-gray-800 text-white p-4 flex justify-between items-center shadow-md">
-        <h1 class="text-xl font-semibold">Remote Desktop Control</h1>
-        <div class="flex items-center space-x-4">
-            <div id="connection-status" class="flex items-center text-sm">
-                <span id="status-dot" class="status-dot status-connecting"></span>
+<body class="bg-gray-200 flex flex-col h-screen" tabindex="0"> <header class="bg-gray-800 text-white p-3 flex justify-between items-center shadow-md flex-shrink-0"> <h1 class="text-lg font-semibold">Remote Desktop Control</h1> <div class="flex items-center space-x-3"> <div id="connection-status" class="flex items-center text-xs"> <span id="status-dot" class="status-dot status-connecting"></span>
                 <span id="status-text">Connecting...</span>
             </div>
-             <a href="{{ url_for('logout') }}" class="bg-red-600 hover:bg-red-700 text-white text-sm font-medium py-1 px-3 rounded-md transition duration-150 ease-in-out">Logout</a>
-        </div>
+             <a href="{{ url_for('logout') }}" class="bg-red-600 hover:bg-red-700 text-white text-xs font-medium py-1 px-2 rounded-md transition duration-150 ease-in-out">Logout</a> </div>
     </header>
 
-    <main class="flex-grow flex flex-col md:flex-row p-4 gap-4 overflow-hidden">
-        <div class="flex-grow bg-black rounded-lg shadow-inner flex items-center justify-center overflow-hidden" id="screen-view-container">
+    <main class="flex-grow flex p-2 gap-2 overflow-hidden"> <div class="flex-grow bg-black rounded-lg shadow-inner flex items-center justify-center overflow-hidden" id="screen-view-container">
             <div id="screen-view">
-                 <img id="screen-image" src="https://placehold.co/1920x1080/333333/CCCCCC?text=Waiting+for+Remote+Screen+(1080p)" alt="Remote Screen"
+                 <img id="screen-image" src="https://placehold.co/1920x1080/333333/CCCCCC?text=Waiting+for+Remote+Screen..." alt="Remote Screen"
                       onerror="this.onerror=null; this.src='https://placehold.co/600x338/333333/CCCCCC?text=Error+Loading+Screen';">
             </div>
         </div>
 
-        <aside class="w-full md:w-64 bg-white p-4 rounded-lg shadow-md flex flex-col space-y-4 overflow-y-auto">
-            <h2 class="text-lg font-semibold text-gray-700 border-b pb-2">Controls</h2>
-            <div>
-                <label for="keyboard-input" class="block text-sm font-medium text-gray-600 mb-1">Keyboard Input</label>
-                <input type="text" id="keyboard-input" placeholder="Type here and press Enter"
-                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500">
-                 <p class="text-xs text-gray-500 mt-1">Sends text on Enter.</p>
-            </div>
-            <div>
-                 <label class="block text-sm font-medium text-gray-600 mb-1">Mouse Clicks</label>
-                 <div class="grid grid-cols-2 gap-2">
-                      <button id="left-click-btn" class="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-md text-sm">Left Click</button>
-                      <button id="right-click-btn" class="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-md text-sm">Right Click</button>
-                 </div>
-                 <p class="text-xs text-gray-500 mt-1">Click image for positional clicks.</p>
-            </div>
-            </aside>
-    </main>
+        </main>
 
     <script>
         // Embedded JavaScript
         document.addEventListener('DOMContentLoaded', () => {
             const socket = io(window.location.origin, { path: '/socket.io/' });
             const screenImage = document.getElementById('screen-image');
-            const screenView = document.getElementById('screen-view');
-            const keyboardInput = document.getElementById('keyboard-input');
-            const leftClickBtn = document.getElementById('left-click-btn');
-            const rightClickBtn = document.getElementById('right-click-btn');
+            const screenView = document.getElementById('screen-view'); // Parent div for click feedback
             const connectionStatusDot = document.getElementById('status-dot');
             const connectionStatusText = document.getElementById('status-text');
             let remoteScreenWidth = null;
             let remoteScreenHeight = null;
+            let isControlPressed = false;
+            let isShiftPressed = false;
+            let isAltPressed = false;
+
+            // Make body focusable on load to capture keys immediately
+             document.body.focus();
+             // Refocus body if user clicks elsewhere (e.g., the image)
+             document.addEventListener('click', () => {
+                 document.body.focus();
+             });
+
 
             function updateStatus(status, message) {
                 connectionStatusText.textContent = message;
                 connectionStatusDot.className = `status-dot ${status}`;
             }
 
-            function showClickFeedback(x, y) {
+            function showClickFeedback(x, y, elementRect) {
+                // Adjust position relative to the screenView container
+                const feedbackX = x + elementRect.left;
+                const feedbackY = y + elementRect.top;
+
                 const feedback = document.createElement('div');
                 feedback.className = 'click-feedback';
-                feedback.style.left = `${x}px`;
+                // Position feedback relative to the screenView div, not the image directly
+                feedback.style.left = `${x}px`; // Use click coords relative to image
                 feedback.style.top = `${y}px`;
                 screenView.appendChild(feedback);
                 setTimeout(() => { feedback.remove(); }, 400);
             }
 
             socket.on('connect', () => {
-                console.log('Connected to server via WebSocket');
-                updateStatus('status-connecting', 'Connected to server, waiting for remote PC...');
-                // Request initial state if needed (e.g., ask server if client is already connected)
-                // socket.emit('request_client_status'); // Example custom event
+                console.log('Connected to server');
+                updateStatus('status-connecting', 'Server connected, waiting for remote PC...');
             });
 
             socket.on('disconnect', () => {
@@ -224,10 +196,10 @@ INTERFACE_HTML = """
                 screenImage.src = 'https://placehold.co/1920x1080/555555/CCCCCC?text=Connection+Error';
             });
 
-            // Listen for client PC status updates
             socket.on('client_connected', (data) => {
                 console.log(data.message);
                 updateStatus('status-connected', 'Remote PC Connected');
+                 document.body.focus(); // Ensure body has focus when client connects
             });
 
             socket.on('client_disconnected', (data) => {
@@ -237,115 +209,170 @@ INTERFACE_HTML = """
                 remoteScreenWidth = null; remoteScreenHeight = null;
             });
 
-            // Handle screen updates from the server
             socket.on('screen_update', (data) => {
                 const imageSrc = `data:image/jpeg;base64,${data.image}`;
-                screenImage.src = imageSrc;
+                // Only update src if it's different to potentially reduce flicker/reload
+                // This might be premature optimization, test if needed
+                // if (screenImage.src !== imageSrc) {
+                     screenImage.src = imageSrc;
+                // }
 
-                // Auto-detect resolution from the first image received
-                // This logic seems fine, using an intermediate image object for dimensions
                 if (remoteScreenWidth === null || remoteScreenHeight === null) {
-                    const tempImg = new Image();
-                    tempImg.onload = () => {
-                        if (remoteScreenWidth === null) { // Check again inside callback in case of race condition
-                            remoteScreenWidth = tempImg.naturalWidth;
-                            remoteScreenHeight = tempImg.naturalHeight;
-                            console.log(`Remote screen resolution detected: ${remoteScreenWidth}x${remoteScreenHeight}`);
-                        }
-                    };
-                    tempImg.onerror = () => {
-                        console.error("Error loading image to detect dimensions.");
-                        // Reset placeholder if needed
-                        // screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=Error+Reading+Screen+Dimensions';
-                    };
-                    tempImg.src = imageSrc; // Set src to trigger load
+                     const tempImg = new Image();
+                     tempImg.onload = () => {
+                         if (remoteScreenWidth === null) {
+                             remoteScreenWidth = tempImg.naturalWidth;
+                             remoteScreenHeight = tempImg.naturalHeight;
+                             console.log(`Remote screen resolution detected: ${remoteScreenWidth}x${remoteScreenHeight}`);
+                         }
+                     };
+                     tempImg.onerror = () => console.error("Error loading image to detect dimensions.");
+                     tempImg.src = imageSrc;
                 }
             });
 
-            // Handle errors sent from the server (e.g., client PC not connected)
             socket.on('command_error', (data) => {
                 console.error('Command Error:', data.message);
-                alert(`Command Error: ${data.message}`); // Simple alert for user feedback
+                // Maybe display a less intrusive error message
+                // updateStatus('status-disconnected', `Error: ${data.message}`);
             });
 
-            // --- Event Listeners for Controls ---
-
-            // Handle clicks on the screen image
-            screenImage.addEventListener('click', (event) => {
-                if (!remoteScreenWidth || !remoteScreenHeight) {
-                    console.warn("Remote screen dimensions not yet known. Click ignored.");
-                    return;
-                }
-                const rect = screenImage.getBoundingClientRect();
-                const x = event.clientX - rect.left; // Click position relative to image element
-                const y = event.clientY - rect.top;
-
-                // Calculate corresponding coordinates on the remote screen
-                const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
-                const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
-
-                console.log(`Screen clicked: display(${x.toFixed(0)}, ${y.toFixed(0)}), remote(${remoteX}, ${remoteY})`);
-
-                // Show visual feedback on the interface
-                showClickFeedback(x, y);
-
-                // Send the click command with coordinates
-                const clickCommand = { action: 'click', button: 'left', x: remoteX, y: remoteY };
-                socket.emit('control_command', clickCommand);
-                console.log('Sent left click command:', clickCommand);
-            });
-
-            // Handle right-clicks on the screen image
-            screenImage.addEventListener('contextmenu', (event) => {
-                event.preventDefault(); // Prevent browser context menu
-                if (!remoteScreenWidth || !remoteScreenHeight) {
-                     console.warn("Remote screen dimensions not yet known. Right-click ignored.");
-                     return;
-                }
+            // --- Mouse Event Handling ---
+            screenImage.addEventListener('mousemove', (event) => {
+                if (!remoteScreenWidth || !remoteScreenHeight) return;
                 const rect = screenImage.getBoundingClientRect();
                 const x = event.clientX - rect.left;
                 const y = event.clientY - rect.top;
                 const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
                 const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
 
-                console.log(`Screen right-clicked: display(${x.toFixed(0)}, ${y.toFixed(0)}), remote(${remoteX}, ${remoteY})`);
+                const command = { action: 'move', x: remoteX, y: remoteY };
+                socket.emit('control_command', command);
+                // Debounce or throttle mouse move events if needed to reduce load
+            });
 
-                showClickFeedback(x, y); // Use same feedback for right click
+            screenImage.addEventListener('click', (event) => {
+                if (!remoteScreenWidth || !remoteScreenHeight) return;
+                const rect = screenImage.getBoundingClientRect();
+                const x = event.clientX - rect.left;
+                const y = event.clientY - rect.top;
+                const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
+                const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
 
+                // Send click command WITH coordinates
+                const clickCommand = { action: 'click', button: 'left', x: remoteX, y: remoteY };
+                socket.emit('control_command', clickCommand);
+                console.log('Sent left click command:', clickCommand);
+                showClickFeedback(x, y, rect); // Show feedback relative to image rect
+                 document.body.focus(); // Keep body focused
+            });
+
+            screenImage.addEventListener('contextmenu', (event) => {
+                event.preventDefault();
+                if (!remoteScreenWidth || !remoteScreenHeight) return;
+                const rect = screenImage.getBoundingClientRect();
+                const x = event.clientX - rect.left;
+                const y = event.clientY - rect.top;
+                const remoteX = Math.round((x / rect.width) * remoteScreenWidth);
+                const remoteY = Math.round((y / rect.height) * remoteScreenHeight);
+
+                // Send right click command WITH coordinates
                 const clickCommand = { action: 'click', button: 'right', x: remoteX, y: remoteY };
                 socket.emit('control_command', clickCommand);
                 console.log('Sent right click command:', clickCommand);
+                showClickFeedback(x, y, rect); // Show feedback relative to image rect
+                 document.body.focus(); // Keep body focused
             });
 
-            // Button clicks (without coordinates - clicks at current cursor position on remote)
-            leftClickBtn.addEventListener('click', () => {
-                socket.emit('control_command', { action: 'click', button: 'left' });
-                console.log('Sent left click command (button)');
-            });
+             // --- Mouse Wheel Handling ---
+             screenImage.addEventListener('wheel', (event) => {
+                event.preventDefault(); // Prevent page scroll
+                // Normalize scroll amount (browsers differ)
+                const deltaY = event.deltaY > 0 ? 1 : (event.deltaY < 0 ? -1 : 0); // Vertical scroll clicks
+                const deltaX = event.deltaX > 0 ? 1 : (event.deltaX < 0 ? -1 : 0); // Horizontal scroll clicks
 
-            rightClickBtn.addEventListener('click', () => {
-                socket.emit('control_command', { action: 'click', button: 'right' });
-                console.log('Sent right click command (button)');
-            });
-
-            // Keyboard input handling
-            keyboardInput.addEventListener('keypress', (event) => {
-                if (event.key === 'Enter') {
-                    event.preventDefault(); // Prevent form submission if inside one
-                    const text = keyboardInput.value;
-                    if (text) {
-                        // Send the whole string
-                        const command = { action: 'keypress', key: text, is_string: true };
-                        socket.emit('control_command', command);
-                        console.log('Sent keypress command (string):', command);
-                        keyboardInput.value = ''; // Clear the input field
-                    }
+                if (deltaY !== 0 || deltaX !== 0) {
+                     const command = { action: 'scroll', dx: deltaX, dy: deltaY };
+                     socket.emit('control_command', command);
+                     console.log('Sent scroll command:', command);
                 }
-                // Could add handling for single key presses (non-Enter) if needed
+                 document.body.focus(); // Keep body focused
             });
 
-            // Initial status
+            // --- Keyboard Event Handling ---
+            document.body.addEventListener('keydown', (event) => {
+                // Log the key event for debugging
+                console.log(`KeyDown: Key='${event.key}', Code='${event.code}', Ctrl=${event.ctrlKey}, Shift=${event.shiftKey}, Alt=${event.altKey}`);
+
+                // Basic check to prevent sending modifier keys themselves repeatedly
+                if (event.key === 'Control' || event.key === 'Shift' || event.key === 'Alt' || event.key === 'Meta') {
+                    if (event.key === 'Control') isControlPressed = true;
+                    if (event.key === 'Shift') isShiftPressed = true;
+                    if (event.key === 'Alt') isAltPressed = true;
+                    // Don't send modifier keydown events if you only care about them *with* other keys
+                    // return;
+                }
+
+                 // Prevent default browser behavior for keys we want to send
+                 // Be careful not to block essential browser functions unintentionally
+                if (event.key.length === 1 || event.key.startsWith('Arrow') || ['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown', 'Insert'].includes(event.key) || event.key.startsWith('F')) {
+                     event.preventDefault();
+                }
+                 // Allow browser functions like Ctrl+C, Ctrl+V, Ctrl+R, F5 unless specifically handled
+                 // if (!(event.ctrlKey && ['c', 'v', 'x', 'a'].includes(event.key.toLowerCase())) && event.key !== 'F5' ) {
+                 //     event.preventDefault();
+                 // }
+
+
+                const command = {
+                    action: 'keydown',
+                    key: event.key,       // e.g., 'a', 'Enter', 'Shift'
+                    code: event.code,     // e.g., 'KeyA', 'Enter', 'ShiftLeft'
+                    ctrlKey: event.ctrlKey,
+                    shiftKey: event.shiftKey,
+                    altKey: event.altKey,
+                    metaKey: event.metaKey // Windows key / Command key
+                };
+                socket.emit('control_command', command);
+            });
+
+            document.body.addEventListener('keyup', (event) => {
+                console.log(`KeyUp: Key='${event.key}', Code='${event.code}'`);
+
+                 if (event.key === 'Control') isControlPressed = false;
+                 if (event.key === 'Shift') isShiftPressed = false;
+                 if (event.key === 'Alt') isAltPressed = false;
+
+                // Always send keyup events
+                const command = {
+                    action: 'keyup',
+                    key: event.key,
+                    code: event.code,
+                    // We don't usually need modifier states on keyup, but could include if needed
+                };
+                socket.emit('control_command', command);
+            });
+
+             // Handle losing focus (e.g., browser tab change) - release modifiers
+             window.addEventListener('blur', () => {
+                 console.log('Window blurred - releasing potential modifier keys');
+                 if (isControlPressed) {
+                     socket.emit('control_command', { action: 'keyup', key: 'Control', code: 'ControlLeft' }); // Assume left?
+                     isControlPressed = false;
+                 }
+                  if (isShiftPressed) {
+                     socket.emit('control_command', { action: 'keyup', key: 'Shift', code: 'ShiftLeft' }); // Assume left?
+                     isShiftPressed = false;
+                 }
+                  if (isAltPressed) {
+                     socket.emit('control_command', { action: 'keyup', key: 'Alt', code: 'AltLeft' }); // Assume left?
+                     isAltPressed = false;
+                 }
+             });
+
+
             updateStatus('status-connecting', 'Initializing...');
+             document.body.focus(); // Try focusing body initially
 
         }); // End DOMContentLoaded
     </script>
@@ -356,182 +383,133 @@ INTERFACE_HTML = """
 # --- Flask Routes ---
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    """Handles login attempts and shows the login page."""
     if request.method == 'POST':
         password = request.form.get('password')
         if check_auth(password):
             session['authenticated'] = True
-            # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
-            print(f"Login successful for user at: {request.remote_addr}") # Log successful login
+            print(f"Login successful for session: {request.sid}")
             return redirect(url_for('interface'))
         else:
-            # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
-            print(f"Login failed for user at: {request.remote_addr}") # Log failed login
+            print(f"Login failed for session: {request.sid}")
             return render_template_string(LOGIN_HTML, error="Invalid password")
 
-    # If already authenticated (e.g., user refreshes page), redirect to interface
     if session.get('authenticated'):
         return redirect(url_for('interface'))
 
-    # Show login page for GET requests or if authentication fails
     return render_template_string(LOGIN_HTML)
 
 @app.route('/interface')
 def interface():
-    """Shows the main remote control interface if authenticated."""
     if not session.get('authenticated'):
-        # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
-        print(f"Unauthorized access attempt to /interface from {request.remote_addr}") # Log unauthorized access
+        print(f"Unauthorized access attempt to /interface from {request.sid}")
         return redirect(url_for('index'))
-    # User is authenticated, show the main interface
     return render_template_string(INTERFACE_HTML)
 
 @app.route('/logout')
 def logout():
-    """Logs the user out by clearing the session."""
-    # *** FIXED: Cannot access request.sid here. Log remote IP instead. ***
-    print(f"Logging out user from: {request.remote_addr}") # Log logout action
+    print(f"Logging out session: {request.sid}")
     session.pop('authenticated', None)
     return redirect(url_for('index'))
 
 # --- SocketIO Events ---
 @socketio.on('connect')
 def handle_connect():
-    """Handles new SocketIO connections (both web interface and potentially client PC)."""
-    # Note: Authentication for web interface happens via Flask session check in routes.
-    # Authentication for client PC happens via 'register_client' event below.
-    print(f"Socket connected: {request.sid}") # request.sid IS valid here in SocketIO handler
-    # Check if a client PC is already connected and notify the new web interface connection
-    if client_pc_sid:
-        emit('client_connected', {'message': 'Remote PC already connected'}, room=request.sid)
-    else:
-        # Optionally notify that the client PC is not yet connected
-        emit('client_disconnected', {'message': 'Remote PC not connected yet'}, room=request.sid)
-
+    sid = request.sid
+    print(f"Socket connected: {sid}")
+    # Logic to differentiate viewers vs client PC could be added here if needed
+    # e.g., viewers could join a 'viewers' room
+    # if session.get('authenticated'): # Check if it's a web viewer connecting
+    #     viewer_sids.add(sid)
+    #     print(f"Web viewer connected: {sid}")
+    #     if client_pc_sid: # Inform new viewer if client is already connected
+    #          emit('client_connected', {'message': 'Remote PC already connected'}, room=sid)
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """Handles SocketIO disconnections."""
-    global client_pc_sid
-    print(f"Socket disconnected: {request.sid}")
-    # Check if the disconnecting socket IS the registered client PC
-    if request.sid == client_pc_sid:
-        print(f"Client PC ({request.sid}) disconnected.")
+    global client_pc_sid # , viewer_sids
+    sid = request.sid
+    print(f"Socket disconnected: {sid}")
+    if sid == client_pc_sid:
+        print("Client PC disconnected.")
         client_pc_sid = None
-        # Notify all connected web interfaces that the client PC is gone
-        # broadcast=True sends to all clients EXCEPT the sender (who is disconnecting anyway)
-        emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True)
+        emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True, include_self=False) # Notify all viewers
+    # else: # A web viewer disconnected
+    #     viewer_sids.discard(sid)
+    #     print(f"Web viewer disconnected: {sid}")
+
 
 @socketio.on('register_client')
 def handle_register_client(data):
-    """Handles the registration attempt from the client PC."""
     global client_pc_sid
-    client_token = data.get('token') # Client PC should send its password as 'token'
-
+    client_token = data.get('token')
+    sid = request.sid
     if client_token == ACCESS_PASSWORD:
-        print(f"Client PC registration attempt from {request.sid}...")
-        # If a *different* client PC was already connected, disconnect it first.
-        if client_pc_sid and client_pc_sid != request.sid:
-             print(f"New client PC ({request.sid}) connecting, disconnecting old one ({client_pc_sid}).")
-             # Trigger the 'disconnect' handler for the old client
-             socketio.disconnect(client_pc_sid) # Default silent=False is good here
+        if client_pc_sid and client_pc_sid != sid:
+             print(f"New client PC ({sid}) detected, disconnecting old one ({client_pc_sid}).")
+             socketio.disconnect(client_pc_sid) # Triggers disconnect handler
+        elif client_pc_sid == sid:
+             print(f"Client PC ({sid}) re-registered.")
+        else:
+             print(f"Client PC registered: {sid}")
 
-        # Whether it's new or the same one re-registering, store its SID
-        client_pc_sid = request.sid
-        print(f"Client PC registered successfully: {client_pc_sid}")
-
-        # Notify all connected web interfaces that a client PC is now ready
-        emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True)
-        # Send confirmation back specifically to the client PC that just registered
-        emit('registration_success', {'message': 'Registration successful'}, room=request.sid)
+        client_pc_sid = sid
+        emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True, include_self=False) # Notify viewers
+        emit('registration_success', room=sid) # Confirm to client
     else:
-        # Authentication failed for the client PC trying to register
-        print(f"Client PC authentication failed for SID: {request.sid}. Token received: '{client_token}'")
-        emit('registration_fail', {'message': 'Authentication failed'}, room=request.sid)
-        # Disconnect this unauthorized client PC immediately
-        disconnect(request.sid) # disconnect() is a Flask-SocketIO function
+        print(f"Client PC authentication failed for SID: {sid}")
+        emit('registration_fail', {'message': 'Authentication failed'}, room=sid)
+        disconnect(sid)
 
+# --- MODIFIED FUNCTION ---
 @socketio.on('screen_data')
 def handle_screen_data(data):
-    """Receives screen data from the client PC and broadcasts it to web interfaces."""
-    # Ensure this function only processes data from the *currently registered* client PC
+    # Only process data from the registered client PC
     if request.sid != client_pc_sid:
-        # Silently ignore data if it's not from the registered client PC.
-        # Logging here can be very noisy if other sockets somehow send this event.
-        # print(f"Ignoring screen_data from non-client SID: {request.sid}")
         return
 
     try:
         image_data = data.get('image')
         if image_data:
             # *** RE-ENABLED BROADCAST ***
-            # Send the image data to all connected web interfaces
+            # Send screen update to all connected sockets (viewers)
+            # Optimization: Could send only to SIDs in viewer_sids if tracking them
             emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
 
-            # Optional: Reduce logging frequency for performance
-            # import time
-            # if not hasattr(handle_screen_data, 'last_log_time') or time.time() - handle_screen_data.last_log_time > 5:
-            #     print(f"Received and broadcast screen data from {request.sid}, size: {len(image_data)} bytes.")
-            #     handle_screen_data.last_log_time = time.time()
+            # Reduce logging frequency - maybe log only periodically or on errors
+            # print(f"Sent screen update. Size: {len(image_data)}")
 
-        else:
-            print(f"Received empty screen data package from client PC {request.sid}.")
+        # else: # Log if empty data is received (might indicate client issue)
+        #     print(f"Received empty screen data package from {request.sid}.")
 
     except Exception as e:
         print(f"!!! ERROR in handle_screen_data processing data from SID {request.sid}: {e}")
-        # Consider adding full traceback for debugging:
-        # import traceback
-        # print(traceback.format_exc())
-        # Optionally disconnect the client if errors persist, but be cautious
-        # if client_pc_sid == request.sid:
-        #     print(f"Disconnecting client PC {request.sid} due to error in handle_screen_data.")
-        #     disconnect(request.sid)
+        print(traceback.format_exc()) # Print full traceback for errors
+
 
 @socketio.on('control_command')
 def handle_control_command(data):
-    """Receives control commands from an authenticated web interface and forwards to the client PC."""
-    # IMPORTANT: Verify the sender is an *authenticated web interface* using the Flask session
+    sid = request.sid
+    # Verify sender is authenticated web interface *OR* potentially allow other authenticated sources later
     if not session.get('authenticated'):
-        print(f"Unauthenticated control command attempt from {request.sid}. Command ignored.")
-        # Optionally emit an error back, but this might reveal authentication status
-        # emit('command_error', {'message': 'Not authenticated'}, room=request.sid)
-        return # Stop processing unauthenticated commands
+        print(f"Unauthenticated control command attempt from {sid}. Ignoring.")
+        return
 
-    # If the web interface is authenticated, proceed
     if client_pc_sid:
-        # Forward the command specifically to the registered client PC
-        # print(f"Forwarding command from web {request.sid} to client PC ({client_pc_sid}): {data}") # Debug log
+        # Forward the command (move, click, keydown, keyup, scroll) to the client PC
         emit('command', data, room=client_pc_sid)
+        # Optional: Log commands for debugging, but can be very verbose
+        # print(f"Forwarding command from {sid} to {client_pc_sid}: {data.get('action')}")
     else:
-        # No client PC is connected to receive the command
-        print(f"Control command from web {request.sid} received, but no client PC connected.")
-        emit('command_error', {'message': 'Client PC not connected'}, room=request.sid) # Notify sender
+        # Inform the sender if the client PC isn't available
+        emit('command_error', {'message': 'Client PC not connected'}, room=sid)
 
 
 # --- Main Execution ---
 if __name__ == '__main__':
     print("Starting Flask-SocketIO server...")
-    # Get port from environment variable 'PORT' (used by Render, Heroku, etc.)
-    # Default to 5000 if 'PORT' is not set (for local development)
     port = int(os.environ.get('PORT', 5000))
-    # Host '0.0.0.0' makes the server accessible externally (important for Render)
-    host = '0.0.0.0'
-    print(f"Server starting on host {host}, port {port}")
+    print(f"Server will run on host 0.0.0.0, port {port}")
+    print(f"Access password: {'*' * len(ACCESS_PASSWORD) if ACCESS_PASSWORD else 'None'}")
 
-    # Run the SocketIO server using eventlet
-    # debug=False is crucial for production and when using eventlet/gevent workers
-    # Gunicorn will manage workers; this block is mainly for local `python app.py` execution
-    try:
-        socketio.run(app, host=host, port=port, debug=False)
-    except KeyboardInterrupt:
-        print("Server shutting down.")
-    except Exception as e:
-        print(f"Failed to start server: {e}")
-
-
-    # Note for Render deployment:
-    # Your Render 'Start Command' should typically use gunicorn:
-    # web: gunicorn --worker-class eventlet -w 1 app:app
-    # Ensure 'gunicorn' and 'eventlet' are listed in your requirements.txt file.
-    # The '-w 1' (1 worker) is often recommended with SocketIO and eventlet/gevent
-    # to simplify state management, but adjust based on load testing if needed.
+    # Use Gunicorn for production on Render: gunicorn --worker-class eventlet -w 1 app:app
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
