@@ -1,513 +1,384 @@
-# Client implementation (client.py) using ctypes for input control
-# Runs on the Windows PC to capture screen and execute commands
+# Consolidated Server (app.py)
+# Flask web server with SocketIO, HTML, CSS, and JS embedded.
+# Includes direct keyboard event capture in the browser.
+# MODIFIED: Handles both binary ('screen_data_bytes') and Base64 ('screen_data') screen updates.
+# MODIFIED: JavaScript updated for binary data handling.
+# MODIFIED: Added server-side FPS throttling for screen updates.
 
-import socketio
-import mss
-import io
-import base64
-import time
-import threading
+# IMPORTANT: eventlet.monkey_patch() must be called before other imports
+import eventlet
+eventlet.monkey_patch()
+
 import os
-import sys
-from PIL import Image
-import ctypes
-import ctypes.wintypes
-import math
+import base64
+import time # Added for FPS throttling
+from flask import Flask, request, session, redirect, url_for, render_template_string, Response
+from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
+import traceback # For detailed error logging
+
 
 # --- Configuration ---
-SERVER_URL = os.environ.get('REMOTE_SERVER_URL', 'https://ssppoo.onrender.com')
-ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too') # MUST MATCH SERVER
+SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_12345')
+ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too')
 
-# Screen capture settings
-FPS = 5  # Can increase slightly with ctypes potentially being faster
-JPEG_QUALITY = 70 # Adjust quality/performance
-
-# Mouse Smoothing settings
-MOUSE_MOVE_DURATION = 0.05 # Time (seconds) for the smoothed move animation
-MOUSE_MOVE_STEPS = 5      # Number of intermediate steps for smoothing
-
-# --- CTypes Constants and Structures ---
-# Constants for mouse_event
-MOUSEEVENTF_MOVE = 0x0001
-MOUSEEVENTF_LEFTDOWN = 0x0002
-MOUSEEVENTF_LEFTUP = 0x0004
-MOUSEEVENTF_RIGHTDOWN = 0x0008
-MOUSEEVENTF_RIGHTUP = 0x0010
-MOUSEEVENTF_MIDDLEDOWN = 0x0020
-MOUSEEVENTF_MIDDLEUP = 0x0040
-MOUSEEVENTF_WHEEL = 0x0800
-MOUSEEVENTF_HWHEEL = 0x1000 # Horizontal wheel
-MOUSEEVENTF_ABSOLUTE = 0x8000
-
-# Constants for keybd_event
-KEYEVENTF_KEYDOWN = 0x0000
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_EXTENDEDKEY = 0x0001 # For keys like Right Ctrl, Right Alt, Arrow keys, etc.
-
-# Basic Virtual-Key Code mapping (Expand as needed)
-# Based on https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes
-VK_CODE_MAP = {
-    # Modifiers (Special handling often needed for L/R versions)
-    'Shift': 0x10, 'ShiftLeft': 0xA0, 'ShiftRight': 0xA1,
-    'Control': 0x11, 'ControlLeft': 0xA2, 'ControlRight': 0xA3,
-    'Alt': 0x12, 'AltLeft': 0xA4, 'AltRight': 0xA5,
-    'Meta': 0x5B, 'MetaLeft': 0x5B, 'MetaRight': 0x5C, # Windows Key
-    'CapsLock': 0x14,
-    'Tab': 0x09,
-    'Enter': 0x0D,
-    'Escape': 0x1B,
-    'Space': 0x20, ' ': 0x20,
-    'Backspace': 0x08,
-    'Delete': 0x2E,
-    'Insert': 0x2D,
-    'Home': 0x24,
-    'End': 0x23,
-    'PageUp': 0x21,
-    'PageDown': 0x22,
-    # Arrow Keys
-    'ArrowUp': 0x26,
-    'ArrowDown': 0x28,
-    'ArrowLeft': 0x25,
-    'ArrowRight': 0x27,
-    # Function Keys
-    'F1': 0x70, 'F2': 0x71, 'F3': 0x72, 'F4': 0x73, 'F5': 0x74, 'F6': 0x75,
-    'F7': 0x76, 'F8': 0x77, 'F9': 0x78, 'F10': 0x79, 'F11': 0x7A, 'F12': 0x7B,
-    # Letters (Case insensitive mapping, VK codes are for uppercase)
-    'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'e': 0x45, 'f': 0x46, 'g': 0x47,
-    'h': 0x48, 'i': 0x49, 'j': 0x4A, 'k': 0x4B, 'l': 0x4C, 'm': 0x4D, 'n': 0x4E,
-    'o': 0x4F, 'p': 0x50, 'q': 0x51, 'r': 0x52, 's': 0x53, 't': 0x54, 'u': 0x55,
-    'v': 0x56, 'w': 0x57, 'x': 0x58, 'y': 0x59, 'z': 0x5A,
-    # Numbers (Top row)
-    '0': 0x30, '1': 0x31, '2': 0x32, '3': 0x33, '4': 0x34,
-    '5': 0x35, '6': 0x36, '7': 0x37, '8': 0x38, '9': 0x39,
-    # Basic Punctuation (May vary with keyboard layout)
-    '`': 0xC0, '-': 0xBD, '=': 0xBB, '[': 0xDB, ']': 0xDD, '\\': 0xDC,
-    ';': 0xBA, "'": 0xDE, ',': 0xBC, '.': 0xBE, '/': 0xBF,
-    # Numpad Keys (Example) - Need separate mapping if distinction required
-    # 'Numpad0': 0x60, ...
-}
-
-# Extended key flag needed for certain keys
-EXTENDED_KEYS = {
-    0xA3, # Right Ctrl
-    0xA5, # Right Alt
-    0x2E, # Delete
-    0x2D, # Insert
-    0x24, # Home
-    0x23, # End
-    0x21, # PageUp
-    0x22, # PageDown
-    0x26, # ArrowUp
-    0x28, # ArrowDown
-    0x25, # ArrowLeft
-    0x27, # ArrowRight
-}
-
-
-user32 = ctypes.windll.user32
-# Get screen dimensions using ctypes (alternative to mss for this specific task)
-screen_width = user32.GetSystemMetrics(0) # SM_CXSCREEN
-screen_height = user32.GetSystemMetrics(1) # SM_CYSCREEN
+# --- Flask App Setup ---
+app = Flask(__name__)
+app.config['SECRET_KEY'] = SECRET_KEY
+# Increased buffer size slightly, might help with larger binary frames sometimes
+socketio = SocketIO(app, async_mode='eventlet', ping_timeout=20, ping_interval=10, max_http_buffer_size=10 * 1024 * 1024)
 
 # --- Global Variables ---
-sio = socketio.Client(logger=False, engineio_logger=False, reconnection_attempts=5, reconnection_delay=3)
-stop_event = threading.Event()
-capture_thread = None
-input_thread = None # Optional thread for input queue if needed
-is_connected = False
-monitor_dimensions = {"width": screen_width, "height": screen_height} # Use ctypes derived dimensions
-last_mouse_pos = {'x': 0, 'y': 0} # Track last known mouse position for smooth move
+client_pc_sid = None
+# --- FPS Throttling Variables ---
+TARGET_FPS = 15 # Increase server FPS target to match client potential (adjust as needed)
+MIN_INTERVAL = 1.0 / TARGET_FPS # Minimum time interval between frames
+last_broadcast_time = 0 # Timestamp of the last broadcast screen update
 
+# --- Authentication ---
+def check_auth(password):
+    return password == ACCESS_PASSWORD
 
-# --- Input Simulation Functions (using CTypes) ---
+# --- HTML Templates (as strings) ---
 
-def get_vk_code(key_name_or_code):
-    """ Tries to map browser key/code names to Windows VK codes. """
-    # Prefer 'code' if available (e.g., 'KeyA', 'Digit1') as it's layout independent
-    # Fallback to 'key' (e.g., 'a', ';', 'Enter')
-    key_lower = key_name_or_code.lower()
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remote Control - Login</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style> body { font-family: 'Inter', sans-serif; } </style>
+</head>
+<body class="bg-gray-100 flex items-center justify-center h-screen">
+    <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-sm">
+        <h1 class="text-2xl font-semibold text-center text-gray-700 mb-6">Remote Access Login</h1>
+        {% if error %}
+            <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+                <span class="block sm:inline">{{ error }}</span>
+            </div>
+        {% endif %}
+        <form method="POST" action="{{ url_for('index') }}">
+            <div class="mb-4">
+                <label for="password" class="block text-gray-700 text-sm font-medium mb-2">Password</label>
+                <input type="password" id="password" name="password" required
+                       class="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                       placeholder="Enter access password">
+            </div>
+            <button type="submit"
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-md transition duration-200 ease-in-out">
+                Login
+            </button>
+        </form>
+    </div>
+</body>
+</html>
+"""
 
-    # Direct lookup using common names/codes
-    if key_name_or_code in VK_CODE_MAP:
-        return VK_CODE_MAP[key_name_or_code]
-    if key_lower in VK_CODE_MAP:
-        return VK_CODE_MAP[key_lower]
+# --- MODIFIED INTERFACE_HTML (JavaScript part updated for binary) ---
+INTERFACE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remote Control Interface</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        html, body { height: 100%; overflow: hidden; font-family: 'Inter', sans-serif; margin: 0; padding: 0; box-sizing: border-box; }
+        #screen-view img { max-width: 100%; max-height: 100%; height: auto; width: auto; display: block; cursor: crosshair; background-color: #333; object-fit: contain; }
+        #screen-view { width: 100%; height: 100%; overflow: hidden; position: relative; display: flex; align-items: center; justify-content: center; }
+        .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .status-connected { background-color: #4ade80; } .status-disconnected { background-color: #f87171; } .status-connecting { background-color: #fbbf24; }
+        .click-feedback { position: absolute; border: 2px solid red; border-radius: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%) scale(0); pointer-events: none; background-color: rgba(255, 0, 0, 0.3); animation: click-pulse 0.4s ease-out forwards; }
+        @keyframes click-pulse { 0% { transform: translate(-50%, -50%) scale(0.5); opacity: 1; } 100% { transform: translate(-50%, -50%) scale(2); opacity: 0; } }
+        body:focus { outline: none; }
+    </style>
+</head>
+<body class="bg-gray-200 flex flex-col h-screen" tabindex="0">
 
-    # Handle 'KeyA', 'KeyB', etc.
-    if key_name_or_code.startswith('Key'):
-        char = key_name_or_code[3:].lower()
-        if char in VK_CODE_MAP:
-            return VK_CODE_MAP[char]
+    <header class="bg-gray-800 text-white p-3 flex justify-between items-center shadow-md flex-shrink-0">
+        <h1 class="text-lg font-semibold">Remote Desktop Control</h1>
+        <div class="flex items-center space-x-3">
+            <div id="connection-status" class="flex items-center text-xs">
+                <span id="status-dot" class="status-dot status-connecting"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+             <a href="{{ url_for('logout') }}" class="bg-red-600 hover:bg-red-700 text-white text-xs font-medium py-1 px-2 rounded-md transition duration-150 ease-in-out">Logout</a>
+        </div>
+    </header>
 
-    # Handle 'Digit1', 'Digit2', etc.
-    if key_name_or_code.startswith('Digit'):
-        char = key_name_or_code[5:]
-        if char in VK_CODE_MAP:
-            return VK_CODE_MAP[char]
+    <main class="flex-grow flex p-2 gap-2 overflow-hidden">
+        <div class="flex-grow bg-black rounded-lg shadow-inner flex items-center justify-center overflow-hidden" id="screen-view-container">
+            <div id="screen-view">
+                 <img id="screen-image" src="https://placehold.co/1920x1080/333333/CCCCCC?text=Waiting+for+Remote+Screen..." alt="Remote Screen"
+                       onerror="this.onerror=null; this.src='https://placehold.co/600x338/333333/CCCCCC?text=Error+Loading+Screen'; console.error('Image load error:', this.src);">
+            </div>
+        </div>
+    </main>
 
-    # Add more specific mappings here if needed (Numpad keys, etc.)
-    print(f"Warning: Unmapped key/code: {key_name_or_code}")
-    return None
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const socket = io(window.location.origin, { path: '/socket.io/' });
+            const screenImage = document.getElementById('screen-image');
+            const screenView = document.getElementById('screen-view');
+            const connectionStatusDot = document.getElementById('status-dot');
+            const connectionStatusText = document.getElementById('status-text');
+            let remoteScreenWidth = null;
+            let remoteScreenHeight = null;
+            let activeModifiers = { ctrl: false, shift: false, alt: false, meta: false };
+            let currentImageUrl = null; // To manage Blob URL cleanup
 
+            document.body.focus();
+            document.addEventListener('click', (e) => { if (e.target !== screenImage) { document.body.focus(); } });
 
-def press_key(vk_code):
-    """ Sends a key down event using keybd_event. """
-    if vk_code is None: return
-    flags = KEYEVENTF_KEYDOWN
-    if vk_code in EXTENDED_KEYS:
-        flags |= KEYEVENTF_EXTENDEDKEY
-    # Use MapVirtualKey to get scan code (optional, 0 often works)
-    # scan_code = user32.MapVirtualKeyW(vk_code, 0) # MAPVK_VK_TO_VSC
-    user32.keybd_event(vk_code, 0, flags, 0)
-    # print(f"Pressed VK: {hex(vk_code)}") # Debug
+            function updateStatus(status, message) { connectionStatusText.textContent = message; connectionStatusDot.className = `status-dot ${status}`; }
+            function showClickFeedback(x, y, elementRect) { const feedback = document.createElement('div'); feedback.className = 'click-feedback'; feedback.style.left = `${x}px`; feedback.style.top = `${y}px`; screenView.appendChild(feedback); setTimeout(() => { feedback.remove(); }, 400); }
 
-def release_key(vk_code):
-    """ Sends a key up event using keybd_event. """
-    if vk_code is None: return
-    flags = KEYEVENTF_KEYUP
-    if vk_code in EXTENDED_KEYS:
-        flags |= KEYEVENTF_EXTENDEDKEY
-    # scan_code = user32.MapVirtualKeyW(vk_code, 0)
-    user32.keybd_event(vk_code, 0, flags, 0)
-    # print(f"Released VK: {hex(vk_code)}") # Debug
+            socket.on('connect', () => { console.log('Connected to server'); updateStatus('status-connecting', 'Server connected, waiting for remote PC...'); });
+            socket.on('disconnect', () => { console.warn('Disconnected from server'); updateStatus('status-disconnected', 'Server disconnected'); if (currentImageUrl) URL.revokeObjectURL(currentImageUrl); screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=Server+Disconnected'; remoteScreenWidth = null; remoteScreenHeight = null; currentImageUrl = null;});
+            socket.on('connect_error', (error) => { console.error('Connection Error:', error); updateStatus('status-disconnected', 'Connection Error'); if (currentImageUrl) URL.revokeObjectURL(currentImageUrl); screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=Connection+Error'; currentImageUrl = null; });
+            socket.on('client_connected', (data) => { console.log(data.message); updateStatus('status-connected', 'Remote PC Connected'); document.body.focus(); });
+            socket.on('client_disconnected', (data) => { console.warn(data.message); updateStatus('status-disconnected', 'Remote PC Disconnected'); if (currentImageUrl) URL.revokeObjectURL(currentImageUrl); screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=PC+Disconnected'; remoteScreenWidth = null; remoteScreenHeight = null; currentImageUrl = null; });
+            socket.on('command_error', (data) => { console.error('Command Error:', data.message); });
 
+            // --- *** NEW: Handler for Binary Screen Data *** ---
+            socket.on('screen_frame_bytes', (imageDataBytes) => {
+                // imageDataBytes is expected to be ArrayBuffer or similar
+                const blob = new Blob([imageDataBytes], { type: 'image/jpeg' });
+                const newImageUrl = URL.createObjectURL(blob);
 
-def mouse_move_to(x, y, smooth=True):
-    """ Moves the mouse cursor to absolute coordinates (x, y). """
-    global last_mouse_pos
-    target_x = max(0, min(int(x), screen_width - 1))
-    target_y = max(0, min(int(y), screen_height - 1))
+                // --- Detect Resolution on First Frame ---
+                if (remoteScreenWidth === null || remoteScreenHeight === null) {
+                    const tempImg = new Image();
+                    tempImg.onload = () => {
+                        if (remoteScreenWidth === null) { // Check again inside onload
+                           remoteScreenWidth = tempImg.naturalWidth;
+                           remoteScreenHeight = tempImg.naturalHeight;
+                           console.log(`Remote screen resolution detected: ${remoteScreenWidth}x${remoteScreenHeight}`);
+                        }
+                        URL.revokeObjectURL(tempImg.src); // Clean up temp image URL
+                    };
+                    tempImg.onerror = () => {
+                        console.error("Error loading image dimensions from blob.");
+                        URL.revokeObjectURL(tempImg.src);
+                    };
+                    tempImg.src = newImageUrl; // Use the blob URL for dimension check
+                }
 
-    if not smooth or (target_x == last_mouse_pos['x'] and target_y == last_mouse_pos['y']):
-        user32.SetCursorPos(target_x, target_y)
-    else:
-        start_x = last_mouse_pos['x']
-        start_y = last_mouse_pos['y']
-        start_time = time.monotonic()
-        end_time = start_time + MOUSE_MOVE_DURATION
+                // --- Update Image and Cleanup Old URL ---
+                // Store the URL we are about to replace
+                const previousUrl = currentImageUrl;
+                currentImageUrl = newImageUrl; // Update the current URL immediately
 
-        while time.monotonic() < end_time:
-            elapsed = time.monotonic() - start_time
-            progress = min(elapsed / MOUSE_MOVE_DURATION, 1.0)
-            # Simple linear interpolation (could use easing functions)
-            current_x = int(start_x + (target_x - start_x) * progress)
-            current_y = int(start_y + (target_y - start_y) * progress)
-            user32.SetCursorPos(current_x, current_y)
-            # Need a small sleep to allow steps, but too long makes it jerky
-            step_sleep = MOUSE_MOVE_DURATION / MOUSE_MOVE_STEPS / 2 # Heuristic
-            time.sleep(max(0.001, step_sleep)) # Minimum sleep
+                screenImage.onload = () => {
+                    // Only revoke the *previous* URL once the new image has successfully loaded
+                    if (previousUrl) {
+                        // console.log("Revoking old blob URL:", previousUrl); // Debug
+                        URL.revokeObjectURL(previousUrl);
+                    }
+                };
+                 screenImage.onerror = () => {
+                     console.error("Error loading image blob:", newImageUrl);
+                     // Don't revoke the new URL on error, maybe it will load later? Or revoke?
+                     // Let's revoke it to be safe if loading fails.
+                     if(currentImageUrl === newImageUrl) { // Check if it hasn't been replaced already
+                         URL.revokeObjectURL(newImageUrl);
+                         currentImageUrl = previousUrl; // Revert to previous potentially? Risky. Better to just clear.
+                         currentImageUrl = null;
+                     } else if(previousUrl) { // If it failed but was already replaced, revoke previous
+                          URL.revokeObjectURL(previousUrl);
+                     }
 
-        # Ensure final position is exact
-        user32.SetCursorPos(target_x, target_y)
+                 };
+                screenImage.src = newImageUrl;
+            });
 
-    last_mouse_pos = {'x': target_x, 'y': target_y}
+            // --- OLD Base64 Handler (Commented out or remove if client ONLY sends binary) ---
+            /*
+            socket.on('screen_update', (data) => {
+                 const imageSrc = `data:image/jpeg;base64,${data.image}`;
+                 screenImage.src = imageSrc;
+                 // Original resolution detection logic here (would need cleanup too)
+                 console.log("Received Base64 frame (Legacy Handler)");
+            });
+            */
 
+            // --- Mouse Handling (Unchanged) ---
+             screenImage.addEventListener('mousemove', (event) => { if (!remoteScreenWidth) return; const rect = screenImage.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const remoteX = Math.round((x / rect.width) * remoteScreenWidth); const remoteY = Math.round((y / rect.height) * remoteScreenHeight); socket.emit('control_command', { action: 'move', x: remoteX, y: remoteY }); });
+             screenImage.addEventListener('click', (event) => { if (!remoteScreenWidth) return; const rect = screenImage.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const remoteX = Math.round((x / rect.width) * remoteScreenWidth); const remoteY = Math.round((y / rect.height) * remoteScreenHeight); socket.emit('control_command', { action: 'click', button: 'left', x: remoteX, y: remoteY }); showClickFeedback(x, y, rect); document.body.focus(); });
+             screenImage.addEventListener('contextmenu', (event) => { event.preventDefault(); if (!remoteScreenWidth) return; const rect = screenImage.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const remoteX = Math.round((x / rect.width) * remoteScreenWidth); const remoteY = Math.round((y / rect.height) * remoteScreenHeight); socket.emit('control_command', { action: 'click', button: 'right', x: remoteX, y: remoteY }); showClickFeedback(x, y, rect); document.body.focus(); });
+             screenImage.addEventListener('wheel', (event) => { event.preventDefault(); const deltaY = event.deltaY > 0 ? 1 : (event.deltaY < 0 ? -1 : 0); const deltaX = event.deltaX > 0 ? 1 : (event.deltaX < 0 ? -1 : 0); if (deltaY !== 0 || deltaX !== 0) { socket.emit('control_command', { action: 'scroll', dx: deltaX, dy: deltaY }); } document.body.focus(); });
 
-def mouse_click(button='left'):
-    """ Performs a mouse click using mouse_event. """
-    if button == 'left':
-        down_flag, up_flag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
-    elif button == 'right':
-        down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
-    elif button == 'middle':
-        down_flag, up_flag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
-    else:
-        print(f"Unsupported click button: {button}")
-        return
+            // --- Keyboard Event Handling (Unchanged) ---
+            document.body.addEventListener('keydown', (event) => {
+                // console.log(`KeyDown: Key='${event.key}', Code='${event.code}', Ctrl=${event.ctrlKey}, Shift=${event.shiftKey}, Alt=${event.altKey}, Meta=${event.metaKey}`); // Debug
+                if (event.key === 'Control') activeModifiers.ctrl = true; if (event.key === 'Shift') activeModifiers.shift = true; if (event.key === 'Alt') activeModifiers.alt = true; if (event.key === 'Meta') activeModifiers.meta = true;
+                let shouldPreventDefault = false; const isModifierKey = ['Control', 'Shift', 'Alt', 'Meta', 'CapsLock', 'NumLock', 'ScrollLock'].includes(event.key); const isFKey = event.key.startsWith('F') && event.key.length > 1 && !isNaN(parseInt(event.key.substring(1))); const keysToPrevent = [ 'Tab', 'Enter', 'Escape', 'Backspace', 'Delete', 'Insert', 'Home', 'End', 'PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ' ];
+                if (event.key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey) { shouldPreventDefault = true; } else if (keysToPrevent.includes(event.key) && !(event.altKey && event.key === 'Tab')) { shouldPreventDefault = true; }
+                if (event.metaKey && event.shiftKey && event.key.toLowerCase() === 's') { shouldPreventDefault = false; } if (event.altKey && event.key === 'Tab') { shouldPreventDefault = false; } if (event.ctrlKey && ['c', 'v', 'x', 'a', 'z', 'y', 'r', 't', 'w', 'l', 'p', 'f'].includes(event.key.toLowerCase())) { shouldPreventDefault = false; } if (isFKey) { shouldPreventDefault = false; } if (event.ctrlKey && event.shiftKey && ['i', 'j', 'c'].includes(event.key.toLowerCase())) { shouldPreventDefault = false; } if (event.ctrlKey && event.key === 'Tab') { shouldPreventDefault = false; }
+                if (shouldPreventDefault) { event.preventDefault(); }
+                const command = { action: 'keydown', key: event.key, code: event.code, ctrlKey: event.ctrlKey, shiftKey: event.shiftKey, altKey: event.altKey, metaKey: event.metaKey }; socket.emit('control_command', command);
+            });
+            document.body.addEventListener('keyup', (event) => {
+                // console.log(`KeyUp: Key='${event.key}', Code='${event.code}'`); // Debug
+                 if (event.key === 'Control') activeModifiers.ctrl = false; if (event.key === 'Shift') activeModifiers.shift = false; if (event.key === 'Alt') activeModifiers.alt = false; if (event.key === 'Meta') activeModifiers.meta = false;
+                 const command = { action: 'keyup', key: event.key, code: event.code }; socket.emit('control_command', command);
+            });
+             window.addEventListener('blur', () => {
+                 console.log('Window blurred - releasing tracked modifier keys');
+                 if (activeModifiers.ctrl) { socket.emit('control_command', { action: 'keyup', key: 'Control', code: 'ControlLeft' }); activeModifiers.ctrl = false; } if (activeModifiers.shift) { socket.emit('control_command', { action: 'keyup', key: 'Shift', code: 'ShiftLeft' }); activeModifiers.shift = false; } if (activeModifiers.alt) { socket.emit('control_command', { action: 'keyup', key: 'Alt', code: 'AltLeft' }); activeModifiers.alt = false; } if (activeModifiers.meta) { socket.emit('control_command', { action: 'keyup', key: 'Meta', code: 'MetaLeft' }); activeModifiers.meta = false; }
+             });
 
-    user32.mouse_event(down_flag, 0, 0, 0, 0)
-    time.sleep(0.01) # Small delay between down/up
-    user32.mouse_event(up_flag, 0, 0, 0, 0)
+            updateStatus('status-connecting', 'Initializing...');
+             document.body.focus();
 
-def mouse_scroll(dx=0, dy=0):
-    """ Performs mouse wheel scroll using mouse_event. """
-    # dy: positive down, negative up
-    # dx: positive right, negative left
-    wheel_delta_unit = 120 # Standard unit for wheel delta
+        }); // End DOMContentLoaded
+    </script>
+</body>
+</html>
+"""
 
-    if dy != 0:
-        scroll_amount = -int(dy * wheel_delta_unit) # Invert dy for MOUSEEVENTF_WHEEL
-        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, scroll_amount, 0)
-
-    if dx != 0:
-         scroll_amount = int(dx * wheel_delta_unit)
-         user32.mouse_event(MOUSEEVENTF_HWHEEL, 0, 0, scroll_amount, 0)
-
-
-# --- Utility Functions ---
-def get_primary_monitor_dimensions_mss():
-    """Gets the dimensions of the primary monitor using mss (as fallback)."""
-    try:
-        with mss.mss() as sct:
-            if len(sct.monitors) > 1:
-                monitor = sct.monitors[1]
-                return {"width": monitor["width"], "height": monitor["height"]}
-            elif len(sct.monitors) == 1:
-                 monitor = sct.monitors[0]
-                 if monitor["width"] > 0 and monitor["height"] > 0:
-                      return {"width": monitor["width"], "height": monitor["height"]}
-            return None
-    except Exception as e:
-        print(f"Error getting monitor dimensions via mss: {e}")
-        return None
-
-# --- Screen Capture Thread ---
-def capture_and_send_screen():
-    """Captures the screen and sends it to the server via SocketIO."""
-    global is_connected, monitor_dimensions
-    last_capture_time = 0
-    interval = 1.0 / FPS
-
-    if not monitor_dimensions:
-        print("Error: Monitor dimensions not available. Trying mss fallback...")
-        monitor_dimensions = get_primary_monitor_dimensions_mss()
-        if not monitor_dimensions:
-             print("FATAL: Could not determine monitor dimensions.")
-             stop_event.set()
-             return
-
-    monitor_area = {"top": 0, "left": 0, "width": monitor_dimensions["width"], "height": monitor_dimensions["height"]}
-    print(f"Capture thread starting for area: {monitor_area}")
-
-    try:
-        with mss.mss() as sct_instance:
-            while not stop_event.is_set():
-                if not is_connected:
-                    time.sleep(0.5)
-                    continue
-
-                current_time = time.time()
-                sleep_duration = interval - (current_time - last_capture_time)
-                if sleep_duration > 0:
-                    time.sleep(sleep_duration)
-
-                last_capture_time = time.time()
-
-                try:
-                    img = sct_instance.grab(monitor_area)
-                    pil_img = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
-                    buffer = io.BytesIO()
-                    pil_img.save(buffer, format='JPEG', quality=JPEG_QUALITY)
-                    buffer.seek(0)
-                    img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-
-                    if is_connected:
-                        sio.emit('screen_data', {'image': img_base64})
-
-                except mss.ScreenShotError as ex:
-                    print(f"Screen capture error: {ex}. Retrying...")
-                    time.sleep(1)
-                except socketio.exceptions.BadNamespaceError:
-                    print("SocketIO BadNamespaceError during send. Disconnected?")
-                    is_connected = False
-                    time.sleep(2)
-                except Exception as e:
-                    print(f"An error occurred in capture loop: {e}")
-                    if not sio.connected:
-                         is_connected = False
-                    time.sleep(1)
-
-    except Exception as e:
-        print(f"FATAL: Failed to initialize mss within capture thread: {e}")
-        stop_event.set()
-
-    print("Screen capture thread stopped.")
-
-
-# --- SocketIO Event Handlers ---
-@sio.event
-def connect():
-    global is_connected, monitor_dimensions, last_mouse_pos
-    print(f"Successfully connected to server: {SERVER_URL} (sid: {sio.sid})")
-
-    # Use ctypes dimensions primarily
-    monitor_dimensions = {"width": screen_width, "height": screen_height}
-    print(f"Primary monitor dimensions (ctypes): {monitor_dimensions['width']}x{monitor_dimensions['height']}")
-
-    # Get initial mouse position
-    point = ctypes.wintypes.POINT()
-    user32.GetCursorPos(ctypes.byref(point))
-    last_mouse_pos = {'x': point.x, 'y': point.y}
-    print(f"Initial mouse position: {last_mouse_pos}")
-
-
-    print("Registering with server...")
-    is_connected = True
-    try:
-        sio.emit('register_client', {'token': ACCESS_PASSWORD})
-    except Exception as e:
-        print(f"Error emitting registration: {e}")
-        is_connected = False
-        if sio.connected:
-            sio.disconnect()
-
-@sio.event
-def connect_error(data):
-    global is_connected
-    print(f"Connection failed: {data}")
-    is_connected = False
-    stop_event.set()
-
-@sio.event
-def disconnect():
-    global is_connected
-    print("Disconnected from server.")
-    is_connected = False
-    stop_event.set() # Signal capture thread to stop
-
-@sio.on('registration_success')
-def on_registration_success():
-    global capture_thread
-    print("Client registration successful.")
-    if capture_thread is None or not capture_thread.is_alive():
-        print("Starting screen capture thread...")
-        stop_event.clear()
-        try:
-            capture_thread = threading.Thread(target=capture_and_send_screen, args=(), daemon=True)
-            capture_thread.start()
-        except Exception as e:
-             print(f"Failed to start capture thread: {e}")
-             stop_event.set()
-             is_connected = False
-             if sio.connected:
-                 sio.disconnect()
-    else:
-        print("Capture thread already running.")
-
-@sio.on('registration_fail')
-def on_registration_fail(data):
-    print(f"Client registration failed: {data.get('message', 'No reason given')}")
-    is_connected = False
-    sio.disconnect()
-
-# --- MODIFIED Command Handler ---
-@sio.on('command')
-def handle_command(data):
-    action = data.get('action')
-    # print(f"Received command: {action}", data) # Debug
-
-    if not is_connected:
-        print("Cannot execute command, not connected/registered.")
-        return
-
-    try:
-        if action == 'move':
-            x = data.get('x')
-            y = data.get('y')
-            if x is not None and y is not None:
-                mouse_move_to(x, y, smooth=True) # Use smooth move
-
-        elif action == 'click':
-            button = data.get('button', 'left')
-            x = data.get('x') # Optional coordinates for click
-            y = data.get('y')
-            if x is not None and y is not None:
-                mouse_move_to(x, y, smooth=False) # Move instantly before click
-            mouse_click(button)
-
-        elif action == 'keydown':
-            key_name = data.get('key') # e.g., 'A', 'Enter', 'Shift'
-            key_code_str = data.get('code') # e.g., 'KeyA', 'Enter', 'ShiftLeft'
-            # Prefer 'code' for mapping if available, fallback to 'key'
-            map_key = key_code_str if key_code_str else key_name
-            vk_code = get_vk_code(map_key)
-            if vk_code:
-                 press_key(vk_code)
-            else:
-                 print(f"Could not map keydown: key='{key_name}', code='{key_code_str}'")
-
-        elif action == 'keyup':
-            key_name = data.get('key')
-            key_code_str = data.get('code')
-            map_key = key_code_str if key_code_str else key_name
-            vk_code = get_vk_code(map_key)
-            if vk_code:
-                 release_key(vk_code)
-            else:
-                 print(f"Could not map keyup: key='{key_name}', code='{key_code_str}'")
-
-        elif action == 'scroll':
-            dx = data.get('dx', 0) # Horizontal scroll clicks
-            dy = data.get('dy', 0) # Vertical scroll clicks (positive=down from browser)
-            mouse_scroll(dx=dx, dy=dy)
-
-        # Removed 'keypress' action as we now handle keydown/keyup
-        # Need to handle double_click if required (sequence of clicks)
-
+# --- Flask Routes (Unchanged) ---
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        password = request.form.get('password')
+        if check_auth(password):
+            session['authenticated'] = True
+            print("Login successful.")
+            return redirect(url_for('interface'))
         else:
-            print(f"Unknown command action: {action}")
+            print("Login failed.")
+            return render_template_string(LOGIN_HTML, error="Invalid password")
+    if session.get('authenticated'):
+        return redirect(url_for('interface'))
+    return render_template_string(LOGIN_HTML)
+
+@app.route('/interface')
+def interface():
+    if not session.get('authenticated'):
+        print(f"Unauthorized access attempt to /interface.")
+        return redirect(url_for('index'))
+    return render_template_string(INTERFACE_HTML)
+
+@app.route('/logout')
+def logout():
+    print("Logging out session.")
+    session.pop('authenticated', None)
+    return redirect(url_for('index'))
+
+# --- SocketIO Events (Registration, Command Handling Unchanged) ---
+@socketio.on('connect')
+def handle_connect():
+    sid = request.sid
+    print(f"[SocketIO Connect] SID: {sid}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    global client_pc_sid
+    sid = request.sid
+    print(f"[SocketIO Disconnect] SID: {sid}")
+    if sid == client_pc_sid:
+        print("[!!!] Client PC disconnected.")
+        client_pc_sid = None
+        emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True, include_self=False)
+
+@socketio.on('register_client')
+def handle_register_client(data):
+    global client_pc_sid
+    client_token = data.get('token')
+    sid = request.sid
+    if client_token == ACCESS_PASSWORD:
+        if client_pc_sid and client_pc_sid != sid:
+             print(f"[RegClient] New client ({sid}) replacing old ({client_pc_sid}). Disconnecting old.")
+             try: socketio.disconnect(client_pc_sid)
+             except Exception as e: print(f"Error disconnecting old client {client_pc_sid}: {e}", file=sys.stderr)
+        elif client_pc_sid == sid: print(f"[RegClient] Re-registered: {sid}")
+        else: print(f"[RegClient] Registered: {sid}")
+
+        client_pc_sid = sid
+        emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True, include_self=False)
+        emit('registration_success', room=sid)
+    else:
+        print(f"[RegClient] Authentication failed for SID: {sid}", file=sys.stderr)
+        emit('registration_fail', {'message': 'Authentication failed'}, room=sid)
+        disconnect(sid)
+
+
+# --- *** NEW: Handler for Binary Screen Data *** ---
+@socketio.on('screen_data_bytes')
+def handle_screen_data_bytes(data):
+    global last_broadcast_time # Allow modification
+    if request.sid != client_pc_sid: return # Ignore if not from registered client
+
+    current_time = time.time()
+    if current_time - last_broadcast_time < MIN_INTERVAL:
+        # print(f"Skipping binary frame, interval too short.") # Debug
+        return # Skip frame for throttling
+
+    try:
+        # data is already the raw bytes
+        if data and isinstance(data, bytes):
+            # Broadcast the raw bytes directly
+            emit('screen_frame_bytes', data, broadcast=True, include_self=False)
+            last_broadcast_time = current_time # Update timestamp
+            # print(f"Broadcast binary frame ({len(data)} bytes) at {current_time:.2f}") # Debug
+        else:
+             print(f"Warning: Received non-bytes data on screen_data_bytes from {request.sid}", file=sys.stderr)
 
     except Exception as e:
-        print(f"Error executing command {data}: {e}")
-        print(traceback.format_exc())
+        print(f"!!! ERROR in handle_screen_data_bytes from SID {request.sid}: {e}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
 
 
-# --- Main Execution ---
-def main():
-    global capture_thread, is_connected
-    print("Starting Remote Control Client (CTypes Mode)...")
-    print(f"Server URL: {SERVER_URL}")
-    print(f"Using Password: {'*' * len(ACCESS_PASSWORD) if ACCESS_PASSWORD else 'None'}")
-    print(f"Detected Screen Resolution (CTypes): {screen_width}x{screen_height}")
+# --- Kept OLD Base64 Handler (for fallback if client uses it) ---
+@socketio.on('screen_data')
+def handle_screen_data(data):
+    global last_broadcast_time
+    if request.sid != client_pc_sid: return # Ignore
 
-    while not stop_event.is_set():
-        if is_connected:
-             time.sleep(1)
-             continue
+    print("[Warning] Received data on legacy 'screen_data' event. Client might not be using binary mode.", file=sys.stderr)
 
-        is_connected = False
+    current_time = time.time()
+    if current_time - last_broadcast_time < MIN_INTERVAL: return # Throttle
 
-        try:
-            print(f"Attempting connection to {SERVER_URL}...")
-            sio.connect(SERVER_URL,
-                        transports=['websocket'],
-                        wait_timeout=10)
-            sio.wait() # Blocks until disconnect
-            print("sio.wait() finished (disconnected).")
-
-        except socketio.exceptions.ConnectionError as e:
-            print(f"Connection Error: {e}. Retrying in {sio.reconnection_delay}s...")
-        except Exception as e:
-             print(f"An unexpected error occurred in connection loop: {e}. Retrying in {sio.reconnection_delay}s...")
-
-        # Cleanup after disconnect or failure
-        print("Performing cleanup...")
-        is_connected = False
-        stop_event.set() # Signal capture thread
-        if capture_thread and capture_thread.is_alive():
-            print("Waiting for capture thread to join...")
-            capture_thread.join(timeout=2)
-        capture_thread = None
-
-        if not stop_event.is_set(): # Check if exit requested during cleanup/wait
-            print(f"Waiting {sio.reconnection_delay}s before retrying connection...")
-            stop_event.wait(timeout=sio.reconnection_delay)
-            if stop_event.is_set():
-                 print("Exit requested during retry wait.")
-                 break
-            else:
-                 stop_event.clear() # Clear for next attempt
+    try:
+        image_data = data.get('image') # Expects dict with 'image' key (Base64)
+        if image_data and isinstance(image_data, str):
+            # Broadcast using the old event name expected by the legacy JS handler
+            emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
+            last_broadcast_time = current_time
         else:
-             print("Stop event set, exiting connection loop.")
-             break
+             print(f"Warning: Received invalid data format on screen_data from {request.sid}", file=sys.stderr)
+    except Exception as e:
+        print(f"!!! ERROR in handle_screen_data (legacy) from SID {request.sid}: {e}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
 
 
+# --- Control Command Handler (Unchanged) ---
+@socketio.on('control_command')
+def handle_control_command(data):
+    sid = request.sid
+    if client_pc_sid:
+        emit('command', data, room=client_pc_sid)
+        # print(f"Sent command {data.get('action')} to {client_pc_sid}") # Debug
+    else:
+        emit('command_error', {'message': 'Client PC not connected'}, room=sid)
+
+
+# --- Main Execution (Unchanged) ---
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nCtrl+C detected. Initiating shutdown...")
-        stop_event.set()
-    finally:
-        print("Performing final client cleanup...")
-        stop_event.set()
-        if sio and sio.connected:
-            print("Attempting final disconnection...")
-            sio.disconnect()
-
-        if capture_thread and capture_thread.is_alive():
-             print("Waiting for capture thread final exit...")
-             capture_thread.join(timeout=3)
-
-        print("Client shutdown complete.")
-        sys.exit(0)
+    print("--- Starting Flask-SocketIO Server (Optimized for Binary Data) ---")
+    port = int(os.environ.get('PORT', 5000))
+    print(f"Host: 0.0.0.0 | Port: {port}")
+    print(f"Target Server Broadcast FPS: {TARGET_FPS} (Interval: {MIN_INTERVAL:.3f}s)")
+    print(f"Binary Screen Handler: ENABLED ('screen_data_bytes' -> 'screen_frame_bytes')")
+    print(f"Legacy Base64 Handler: ENABLED ('screen_data' -> 'screen_update')")
+    print(f"Access password configured: {'Yes' if ACCESS_PASSWORD != 'change_this_password_too' else 'No (Using default)'}")
+    print(f"Secret key configured: {'Yes' if SECRET_KEY != 'change_this_strong_secret_key_12345' else 'No (Using default)'}")
+    print("-------------------------------------------------------------")
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
