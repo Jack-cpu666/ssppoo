@@ -19,7 +19,7 @@ SERVER_URL = os.environ.get('REMOTE_SERVER_URL', 'https://ssppoo.onrender.com')
 ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', 'change_this_password_too') # MUST MATCH SERVER
 
 # Screen capture settings
-FPS = 10  # Can increase slightly with ctypes potentially being faster
+FPS = 5  # Can increase slightly with ctypes potentially being faster
 JPEG_QUALITY = 70 # Adjust quality/performance
 
 # Mouse Smoothing settings
