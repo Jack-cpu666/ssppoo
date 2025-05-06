@@ -1,4 +1,4 @@
-# Consolidated Server (app.py)
+# Consolidated Server (app.py
 # Flask web server with SocketIO, HTML, CSS, and JS embedded.
 # Includes direct keyboard event capture in the browser.
 
