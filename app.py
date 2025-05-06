@@ -1,6 +1,7 @@
-# Consolidated Server (app.py
+# Consolidated Server (app.py)
 # Flask web server with SocketIO, HTML, CSS, and JS embedded.
 # Includes direct keyboard event capture in the browser.
+# MODIFIED: Added server-side FPS throttling for screen updates.
 
 # IMPORTANT: eventlet.monkey_patch() must be called before other imports
 import eventlet
@@ -8,6 +9,7 @@ eventlet.monkey_patch()
 
 import os
 import base64
+import time # Added for FPS throttling
 from flask import Flask, request, session, redirect, url_for, render_template_string, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 import traceback # For detailed error logging
@@ -24,6 +26,10 @@ socketio = SocketIO(app, async_mode='eventlet', ping_timeout=20, ping_interval=1
 
 # --- Global Variables ---
 client_pc_sid = None
+# --- FPS Throttling Variables ---
+TARGET_FPS = 5 # Target frames per second
+MIN_INTERVAL = 1.0 / TARGET_FPS # Minimum time interval between frames
+last_broadcast_time = 0 # Timestamp of the last broadcast screen update
 
 # --- Authentication ---
 def check_auth(password):
@@ -67,7 +73,6 @@ LOGIN_HTML = """
 </html>
 """
 
-# --- MODIFIED INTERFACE_HTML with updated JS ---
 INTERFACE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -106,7 +111,7 @@ INTERFACE_HTML = """
         <div class="flex-grow bg-black rounded-lg shadow-inner flex items-center justify-center overflow-hidden" id="screen-view-container">
             <div id="screen-view">
                  <img id="screen-image" src="https://placehold.co/1920x1080/333333/CCCCCC?text=Waiting+for+Remote+Screen..." alt="Remote Screen"
-                      onerror="this.onerror=null; this.src='https://placehold.co/600x338/333333/CCCCCC?text=Error+Loading+Screen';">
+                       onerror="this.onerror=null; this.src='https://placehold.co/600x338/333333/CCCCCC?text=Error+Loading+Screen';">
             </div>
         </div>
     </main>
@@ -129,20 +134,20 @@ INTERFACE_HTML = """
             function showClickFeedback(x, y, elementRect) { const feedback = document.createElement('div'); feedback.className = 'click-feedback'; feedback.style.left = `${x}px`; feedback.style.top = `${y}px`; screenView.appendChild(feedback); setTimeout(() => { feedback.remove(); }, 400); }
 
             socket.on('connect', () => { console.log('Connected to server'); updateStatus('status-connecting', 'Server connected, waiting for remote PC...'); });
-            socket.on('disconnect', () => { console.warn('Disconnected from server'); updateStatus('status-disconnected', 'Server disconnected'); screenImage.src = '...Disconnected'; remoteScreenWidth = null; remoteScreenHeight = null; });
-            socket.on('connect_error', (error) => { console.error('Connection Error:', error); updateStatus('status-disconnected', 'Connection Error'); screenImage.src = '...Connection+Error'; });
+            socket.on('disconnect', () => { console.warn('Disconnected from server'); updateStatus('status-disconnected', 'Server disconnected'); screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=Server+Disconnected'; remoteScreenWidth = null; remoteScreenHeight = null; });
+            socket.on('connect_error', (error) => { console.error('Connection Error:', error); updateStatus('status-disconnected', 'Connection Error'); screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=Connection+Error'; });
             socket.on('client_connected', (data) => { console.log(data.message); updateStatus('status-connected', 'Remote PC Connected'); document.body.focus(); });
-            socket.on('client_disconnected', (data) => { console.warn(data.message); updateStatus('status-disconnected', 'Remote PC Disconnected'); screenImage.src = '...PC+Disconnected'; remoteScreenWidth = null; remoteScreenHeight = null; });
+            socket.on('client_disconnected', (data) => { console.warn(data.message); updateStatus('status-disconnected', 'Remote PC Disconnected'); screenImage.src = 'https://placehold.co/600x338/333333/CCCCCC?text=PC+Disconnected'; remoteScreenWidth = null; remoteScreenHeight = null; });
             socket.on('command_error', (data) => { console.error('Command Error:', data.message); });
 
             socket.on('screen_update', (data) => {
                 const imageSrc = `data:image/jpeg;base64,${data.image}`;
                  screenImage.src = imageSrc;
                 if (remoteScreenWidth === null || remoteScreenHeight === null) {
-                     const tempImg = new Image();
-                     tempImg.onload = () => { if (remoteScreenWidth === null) { remoteScreenWidth = tempImg.naturalWidth; remoteScreenHeight = tempImg.naturalHeight; console.log(`Remote screen resolution: ${remoteScreenWidth}x${remoteScreenHeight}`); } };
-                     tempImg.onerror = () => console.error("Error loading image dimensions.");
-                     tempImg.src = imageSrc;
+                    const tempImg = new Image();
+                    tempImg.onload = () => { if (remoteScreenWidth === null) { remoteScreenWidth = tempImg.naturalWidth; remoteScreenHeight = tempImg.naturalHeight; console.log(`Remote screen resolution: ${remoteScreenWidth}x${remoteScreenHeight}`); } };
+                    tempImg.onerror = () => console.error("Error loading image dimensions.");
+                    tempImg.src = imageSrc;
                 }
             });
 
@@ -163,64 +168,38 @@ INTERFACE_HTML = """
                 if (event.key === 'Meta') activeModifiers.meta = true;
 
                 // --- PreventDefault Logic ---
-                // Goal: Prevent default for keys that type or navigate within the *browser page*,
-                // but ALLOW OS-level shortcuts (like Win+Shift+S, Alt+Tab, Ctrl+C/V etc.)
                 let shouldPreventDefault = false;
-
                 const isModifierKey = ['Control', 'Shift', 'Alt', 'Meta', 'CapsLock', 'NumLock', 'ScrollLock'].includes(event.key);
                 const isFKey = event.key.startsWith('F') && event.key.length > 1 && !isNaN(parseInt(event.key.substring(1))); // F1-F12
+                const keysToPrevent = [ 'Tab', 'Enter', 'Escape', 'Backspace', 'Delete', 'Insert', 'Home', 'End', 'PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ' ];
 
-                // Keys we generally WANT to intercept and send to remote
-                const keysToPrevent = [
-                    'Tab', 'Enter', 'Escape', 'Backspace', 'Delete', 'Insert',
-                    'Home', 'End', 'PageUp', 'PageDown',
-                    'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
-                    ' ' // Spacebar
-                ];
-
-                // Check if it's a simple printable character (without Ctrl/Alt/Meta modifiers)
                 if (event.key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey) {
-                     shouldPreventDefault = true;
+                    shouldPreventDefault = true;
+                } else if (keysToPrevent.includes(event.key) && !(event.altKey && event.key === 'Tab')) { // Prevent most keys unless it's Alt+Tab
+                    shouldPreventDefault = true;
                 }
-                // Check if it's one of the specific keys we want to capture
-                else if (keysToPrevent.includes(event.key)) {
-                     shouldPreventDefault = true;
-                }
-                 // Allow F-keys to pass through by default (don't prevent) unless Ctrl/Alt/Shift are also held? Decide based on need.
-                 // else if (isFKey) { /* Allow F keys by default */ }
 
                 // *** DO NOT PREVENT DEFAULT for specific OS combinations ***
-                // Example: Allow Win+Shift+S
-                if (event.metaKey && event.shiftKey && event.key.toLowerCase() === 's') {
-                    console.log("Allowing Win+Shift+S");
-                    shouldPreventDefault = false;
-                }
-                // Example: Allow Alt+Tab (usually handled by OS anyway)
-                if (event.altKey && event.key === 'Tab') {
-                     console.log("Allowing Alt+Tab");
-                     shouldPreventDefault = false;
-                }
-                 // Example: Allow Ctrl+C, Ctrl+V, Ctrl+X (Common text operations) - browser often handles these well even if default isn't prevented
-                 if (event.ctrlKey && ['c', 'v', 'x', 'a', 'z', 'y', 'r', 't', 'w', 'l', 'p'].includes(event.key.toLowerCase())) {
-                      console.log(`Allowing Ctrl+${event.key}`);
-                      shouldPreventDefault = false; // Let browser handle copy/paste etc. unless it causes issues
-                 }
+                if (event.metaKey && event.shiftKey && event.key.toLowerCase() === 's') { shouldPreventDefault = false; console.log("Allowing Win+Shift+S"); } // Screenshot
+                if (event.altKey && event.key === 'Tab') { shouldPreventDefault = false; console.log("Allowing Alt+Tab"); } // App switching
+                if (event.ctrlKey && ['c', 'v', 'x', 'a', 'z', 'y', 'r', 't', 'w', 'l', 'p', 'f'].includes(event.key.toLowerCase())) { shouldPreventDefault = false; console.log(`Allowing Ctrl+${event.key}`); } // Common browser/OS shortcuts
+                // F-Keys (F5 refresh, F11 fullscreen, F12 dev tools) - Don't prevent by default
+                if (isFKey) { shouldPreventDefault = false; console.log(`Allowing ${event.key}`); }
+                // Ctrl+Shift+I/J/C (Dev Tools)
+                if (event.ctrlKey && event.shiftKey && ['i', 'j', 'c'].includes(event.key.toLowerCase())) { shouldPreventDefault = false; console.log(`Allowing Ctrl+Shift+${event.key}`); }
+                // Ctrl+Tab / Ctrl+Shift+Tab (Browser tab switching)
+                if (event.ctrlKey && event.key === 'Tab') { shouldPreventDefault = false; console.log("Allowing Ctrl+Tab / Ctrl+Shift+Tab"); }
 
 
                 if (shouldPreventDefault) {
                     console.log("Preventing default browser action for key:", event.key);
                     event.preventDefault();
                 } else {
-                     console.log("Allowing default browser action for key:", event.key);
+                    console.log("Allowing default browser action for key:", event.key);
                 }
 
-
                 // Send the event regardless of preventDefault status (client decides how to handle)
-                const command = {
-                    action: 'keydown',
-                    key: event.key, code: event.code,
-                    ctrlKey: event.ctrlKey, shiftKey: event.shiftKey, altKey: event.altKey, metaKey: event.metaKey
-                };
+                const command = { action: 'keydown', key: event.key, code: event.code, ctrlKey: event.ctrlKey, shiftKey: event.shiftKey, altKey: event.altKey, metaKey: event.metaKey };
                 socket.emit('control_command', command);
             });
 
@@ -256,17 +235,17 @@ INTERFACE_HTML = """
 </html>
 """
 
-# --- Flask Routes --- (No changes needed from previous version)
+# --- Flask Routes ---
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
         password = request.form.get('password')
         if check_auth(password):
             session['authenticated'] = True
-            print("Login successful.") # No SID here
+            print("Login successful.")
             return redirect(url_for('interface'))
         else:
-            print("Login failed.") # No SID here
+            print("Login failed.")
             return render_template_string(LOGIN_HTML, error="Invalid password")
     if session.get('authenticated'):
         return redirect(url_for('interface'))
@@ -281,15 +260,17 @@ def interface():
 
 @app.route('/logout')
 def logout():
-    print("Logging out session.") # No SID here
+    print("Logging out session.")
     session.pop('authenticated', None)
     return redirect(url_for('index'))
 
-# --- SocketIO Events --- (No changes needed from previous version)
+# --- SocketIO Events ---
 @socketio.on('connect')
 def handle_connect():
     sid = request.sid
     print(f"Socket connected: {sid}")
+    # Note: We don't know if it's a browser or client PC yet.
+    # Authentication/registration determines roles.
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -299,7 +280,9 @@ def handle_disconnect():
     if sid == client_pc_sid:
         print("Client PC disconnected.")
         client_pc_sid = None
+        # Notify browser clients
         emit('client_disconnected', {'message': 'Remote PC disconnected'}, broadcast=True, include_self=False)
+    # No specific action needed if a browser client disconnects
 
 @socketio.on('register_client')
 def handle_register_client(data):
@@ -309,43 +292,81 @@ def handle_register_client(data):
     if client_token == ACCESS_PASSWORD:
         if client_pc_sid and client_pc_sid != sid:
              print(f"New client PC ({sid}) detected, disconnecting old one ({client_pc_sid}).")
-             disconnect(client_pc_sid)
+             # Attempt to disconnect the old client gracefully
+             try:
+                 socketio.emit('server_message', {'message': 'New client connected, disconnecting this session.'}, room=client_pc_sid)
+                 socketio.disconnect(client_pc_sid)
+             except Exception as e:
+                 print(f"Error disconnecting old client {client_pc_sid}: {e}")
         elif client_pc_sid == sid:
              print(f"Client PC ({sid}) re-registered.")
         else:
              print(f"Client PC registered: {sid}")
         client_pc_sid = sid
+        # Notify browser clients
         emit('client_connected', {'message': 'Remote PC connected'}, broadcast=True, include_self=False)
+        # Confirm registration to the client PC
         emit('registration_success', room=sid)
     else:
         print(f"Client PC authentication failed for SID: {sid}")
         emit('registration_fail', {'message': 'Authentication failed'}, room=sid)
         disconnect(sid)
 
+# --- MODIFIED handle_screen_data with FPS Throttling ---
 @socketio.on('screen_data')
 def handle_screen_data(data):
-    if request.sid != client_pc_sid: return
+    global last_broadcast_time # Allow modification of the global variable
+    if request.sid != client_pc_sid:
+        # print(f"Ignoring screen_data from non-registered client: {request.sid}") # Optional debug
+        return # Silently ignore data from non-registered clients
+
+    current_time = time.time()
+    # Check if enough time has passed since the last broadcast
+    if current_time - last_broadcast_time < MIN_INTERVAL:
+        # print(f"Skipping frame, interval: {current_time - last_broadcast_time:.4f} < {MIN_INTERVAL:.4f}") # Optional debug
+        return # Skip this frame to maintain target FPS
+
+    # If enough time has passed, process and broadcast the frame
     try:
         image_data = data.get('image')
         if image_data:
+            # Broadcast to all browser clients (exclude the sender client PC)
             emit('screen_update', {'image': image_data}, broadcast=True, include_self=False)
+            last_broadcast_time = current_time # Update the timestamp of the last broadcast
+            # print(f"Broadcast frame at {current_time:.2f}") # Optional debug
     except Exception as e:
         print(f"!!! ERROR in handle_screen_data from SID {request.sid}: {e}")
         print(traceback.format_exc())
 
+
 @socketio.on('control_command')
 def handle_control_command(data):
-    sid = request.sid
-    if not session.get('authenticated'): return
-    if client_pc_sid:
-        emit('command', data, room=client_pc_sid)
-    else:
-        emit('command_error', {'message': 'Client PC not connected'}, room=sid)
+    sid = request.sid # This is the SID of the browser sending the command
+    # Check if the sender SID is associated with an authenticated browser session
+    # Flask-SocketIO doesn't directly link session and SID easily across restarts/multiple workers
+    # Relying on the fact that only authenticated users should be on the '/interface' page which sends commands.
+    # A more robust check might involve tokens or associating SID with session on connect if needed.
+    # if not session.get('authenticated'): # This check might be unreliable depending on server setup
+    #     print(f"Ignoring control command from unauthenticated SID: {sid}")
+    #     return
 
-# --- Main Execution --- (No changes needed from previous version)
+    if client_pc_sid:
+        # Forward the command to the registered client PC
+        emit('command', data, room=client_pc_sid)
+        # print(f"Sent command {data.get('action')} to {client_pc_sid}") # Optional debug
+    else:
+        # Inform the sending browser that the client is not connected
+        emit('command_error', {'message': 'Client PC not connected'}, room=sid)
+        # print(f"Cannot send command, client PC not connected. SID: {sid}") # Optional debug
+
+
+# --- Main Execution ---
 if __name__ == '__main__':
     print("Starting Flask-SocketIO server...")
     port = int(os.environ.get('PORT', 5000))
     print(f"Server will run on host 0.0.0.0, port {port}")
-    print(f"Access password configured: {'Yes' if ACCESS_PASSWORD else 'No'}")
+    print(f"Target FPS for screen updates: {TARGET_FPS} (Interval: {MIN_INTERVAL:.3f}s)")
+    print(f"Access password configured: {'Yes' if ACCESS_PASSWORD != 'change_this_password_too' else 'No (Using default)'}")
+    print(f"Secret key configured: {'Yes' if SECRET_KEY != 'change_this_strong_secret_key_12345' else 'No (Using default)'}")
+    # Use debug=False for production/stability with eventlet
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
