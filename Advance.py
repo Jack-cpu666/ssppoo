@@ -1,7 +1,3 @@
-# Client implementation (client.py) using ctypes for input control
-# OPTIMIZED VERSION 2: Sends binary JPEG data, tunable quality/FPS, improved timing & robustness.
-# Runs on the Windows PC to capture screen and execute commands
-
 import socketio
 import mss
 import io
@@ -71,7 +67,7 @@ VK_CODE_MAP = {
 
 # Extended key flag needed for certain keys
 EXTENDED_KEYS = {
-    0xA3, 0xA5, 0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x26, 0x28, 0x25, 0x27,
+    0xA3, 0xA5, 0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x26, 0x28, 0x25, 0x27, # Right Alt, Right Ctrl, Del, Ins, Home, End, PgUp, PgDn, Arrows
 }
 
 user32 = ctypes.windll.user32
@@ -101,14 +97,50 @@ def get_vk_code(key_name_or_code):
     if not key_name_or_code: return None
     key_lower = key_name_or_code.lower()
 
+    # Direct mapping
     if key_name_or_code in VK_CODE_MAP: return VK_CODE_MAP[key_name_or_code]
     if key_lower in VK_CODE_MAP: return VK_CODE_MAP[key_lower]
+
+    # Handle 'KeyA', 'KeyB', etc.
     if key_name_or_code.startswith('Key') and len(key_name_or_code) == 4:
         char = key_name_or_code[3:].lower()
         if char in VK_CODE_MAP: return VK_CODE_MAP[char]
+
+    # Handle 'Digit0', 'Digit1', etc.
     if key_name_or_code.startswith('Digit') and len(key_name_or_code) == 6:
         char = key_name_or_code[5:]
         if char in VK_CODE_MAP: return VK_CODE_MAP[char]
+
+    # Handle 'Numpad0' - 'Numpad9', 'NumpadDecimal', etc. (Example - add more if needed)
+    if key_name_or_code.startswith('Numpad'):
+        num_part = key_name_or_code[6:]
+        if num_part.isdigit():
+            return 0x60 + int(num_part) # VK_NUMPAD0 to VK_NUMPAD9
+        elif num_part == 'Decimal': return 0x6E # VK_DECIMAL
+        elif num_part == 'Add': return 0x6B # VK_ADD
+        elif num_part == 'Subtract': return 0x6D # VK_SUBTRACT
+        elif num_part == 'Multiply': return 0x6A # VK_MULTIPLY
+        elif num_part == 'Divide': return 0x6F # VK_DIVIDE
+        elif num_part == 'Enter': return 0x0D # Usually same as VK_RETURN, might need EXTENDED
+
+    # Specific key code names
+    if key_name_or_code == 'Semicolon': return VK_CODE_MAP[';']
+    if key_name_or_code == 'Equal': return VK_CODE_MAP['=']
+    if key_name_or_code == 'Comma': return VK_CODE_MAP[',']
+    if key_name_or_code == 'Minus': return VK_CODE_MAP['-']
+    if key_name_or_code == 'Period': return VK_CODE_MAP['.']
+    if key_name_or_code == 'Slash': return VK_CODE_MAP['/']
+    if key_name_or_code == 'Backquote': return VK_CODE_MAP['`']
+    if key_name_or_code == 'BracketLeft': return VK_CODE_MAP['[']
+    if key_name_or_code == 'Backslash': return VK_CODE_MAP['\\']
+    if key_name_or_code == 'BracketRight': return VK_CODE_MAP[']']
+    if key_name_or_code == 'Quote': return VK_CODE_MAP["'"]
+
+    # Fallback for simple characters if not mapped above
+    if len(key_name_or_code) == 1:
+        char_code = ord(key_name_or_code.upper())
+        if 0x30 <= char_code <= 0x39 or 0x41 <= char_code <= 0x5A: # 0-9 or A-Z
+             return char_code
 
     # print(f"Warning: Unmapped key/code: {key_name_or_code}") # Uncomment for debug
     return None
@@ -118,13 +150,16 @@ def press_key(vk_code):
     """ Sends a key down event using keybd_event. """
     if vk_code is None: return
     flags = KEYEVENTF_KEYDOWN | (KEYEVENTF_EXTENDEDKEY if vk_code in EXTENDED_KEYS else 0)
-    user32.keybd_event(vk_code, 0, flags, 0)
+    # Map virtual key code to scan code (optional but can help with some keys/games)
+    scan_code = user32.MapVirtualKeyW(vk_code, 0) # MAPVK_VK_TO_VSC
+    user32.keybd_event(vk_code, scan_code, flags, 0)
 
 def release_key(vk_code):
     """ Sends a key up event using keybd_event. """
     if vk_code is None: return
     flags = KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if vk_code in EXTENDED_KEYS else 0)
-    user32.keybd_event(vk_code, 0, flags, 0)
+    scan_code = user32.MapVirtualKeyW(vk_code, 0) # MAPVK_VK_TO_VSC
+    user32.keybd_event(vk_code, scan_code, flags, 0)
 
 
 def mouse_move_to(x, y, smooth=True):
@@ -139,6 +174,7 @@ def mouse_move_to(x, y, smooth=True):
 
     # Use instant move if smoothing disabled or duration is negligible
     if not smooth or MOUSE_MOVE_DURATION <= 0.001:
+        # print(f"Instant move to {target_x}, {target_y}") # Debug
         user32.SetCursorPos(target_x, target_y)
     else:
         start_time = time.monotonic()
@@ -150,6 +186,7 @@ def mouse_move_to(x, y, smooth=True):
             # Linear interpolation (could use easing if desired)
             interp_x = int(current_x + (target_x - current_x) * progress)
             interp_y = int(current_y + (target_y - current_y) * progress)
+            # print(f" Smooth step {i}: {interp_x}, {interp_y}") # Debug
             user32.SetCursorPos(interp_x, interp_y)
 
             # Precise sleep until next step time
@@ -159,7 +196,9 @@ def mouse_move_to(x, y, smooth=True):
                 time.sleep(sleep_needed)
 
         # Ensure final position is exact
-        user32.SetCursorPos(target_x, target_y)
+        if interp_x != target_x or interp_y != target_y:
+            # print(f" Final move to {target_x}, {target_y}") # Debug
+            user32.SetCursorPos(target_x, target_y)
 
     last_mouse_pos = {'x': target_x, 'y': target_y}
 
@@ -177,11 +216,13 @@ def mouse_click(button='left'):
 
 def mouse_scroll(dx=0, dy=0):
     """ Performs mouse wheel scroll using mouse_event. """
-    wheel_delta_unit = 120
+    wheel_delta_unit = 120 # Standard scroll unit for Windows
     if dy != 0:
+        # Vertical scroll takes negative delta for scroll down
         user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -int(dy * wheel_delta_unit), 0)
         time.sleep(0.005) # Prevent potential scroll loss
     if dx != 0:
+        # Horizontal scroll takes positive delta for scroll right
         user32.mouse_event(MOUSEEVENTF_HWHEEL, 0, 0, int(dx * wheel_delta_unit), 0)
         time.sleep(0.005)
 
@@ -207,7 +248,7 @@ def capture_and_send_screen():
                 # --- Capture ---
                 try:
                     img = sct_instance.grab(monitor_area)
-                    capture_time = time.monotonic()
+                    # capture_time = time.monotonic() # Uncomment for detailed timing
                 except mss.ScreenShotError as ex:
                     print(f"[Capture Thread] Screen capture error: {ex}. Retrying...", file=sys.stderr)
                     time.sleep(1)
@@ -217,11 +258,11 @@ def capture_and_send_screen():
                 try:
                     # Re-use buffer for potential minor efficiency gain
                     buffer = io.BytesIO()
-                    # Note: Image.frombytes is efficient, direct mss->jpeg might exist but adds complexity
+                    # Note: Image.frombytes is efficient for BGRA -> RGB conversion needed by PIL JPEG saver
                     pil_img = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
-                    pil_img.save(buffer, format='JPEG', quality=JPEG_QUALITY)
+                    pil_img.save(buffer, format='JPEG', quality=JPEG_QUALITY, subsampling=0) # subsampling=0 (4:4:4) can improve text clarity slightly, slightly larger file
                     jpeg_data = buffer.getvalue()
-                    encode_time = time.monotonic()
+                    # encode_time = time.monotonic() # Uncomment for detailed timing
                 except Exception as e:
                     print(f"[Capture Thread] Error during Image processing/encoding: {e}", file=sys.stderr)
                     traceback.print_exc(file=sys.stderr)
@@ -229,7 +270,7 @@ def capture_and_send_screen():
                     continue
 
                 # --- Send Data ---
-                send_start_time = time.monotonic()
+                # send_start_time = time.monotonic() # Uncomment for detailed timing
                 if is_connected_and_registered and sio.connected:
                     try:
                         if SEND_BINARY_DATA:
@@ -237,7 +278,7 @@ def capture_and_send_screen():
                         else:
                             img_base64 = base64.b64encode(jpeg_data).decode('utf-8')
                             sio.emit('screen_data', {'image': img_base64})
-                        send_end_time = time.monotonic()
+                        # send_end_time = time.monotonic() # Uncomment for detailed timing
                     except socketio.exceptions.BadNamespaceError:
                         print("[Capture Thread] SocketIO BadNamespaceError during send. Assuming disconnected.", file=sys.stderr)
                         is_connected_and_registered = False # Trigger reconnect logic
@@ -258,13 +299,13 @@ def capture_and_send_screen():
                 # Optional: Print detailed timing for debugging lag
                 # cap_dur = capture_time - frame_start_time
                 # enc_dur = encode_time - capture_time
-                # send_dur = send_end_time - send_start_time
+                # send_dur = send_end_time - send_start_time # Requires uncommenting above timing points
                 # print(f"[Timing] Total: {processing_time:.4f}s (Cap: {cap_dur:.4f}, Enc: {enc_dur:.4f}, Send: {send_dur:.4f}), Sleep: {max(0, sleep_duration):.4f}")
 
                 if sleep_duration > 0.001: # Only sleep if meaningful
                     time.sleep(sleep_duration)
-                elif sleep_duration < -0.01: # Warn if consistently falling behind
-                     print(f"[Capture Thread] Warning: Frame processing took {abs(sleep_duration):.3f}s longer than interval.", file=sys.stderr)
+                # elif sleep_duration < -0.01: # Warn if consistently falling behind
+                #      print(f"[Capture Thread] Warning: Frame processing took {abs(sleep_duration):.3f}s longer than interval.", file=sys.stderr) # Optional verbosity
 
 
             # End of while loop
@@ -282,13 +323,18 @@ def connect():
     global is_connected_and_registered, last_mouse_pos
     is_connected_and_registered = False # Reset flag on new connection
     print(f"[SocketIO] Connection established (sid: {sio.sid}). Registering...")
-    # Get current mouse position on connect
+    # Get current mouse position on connect to initialize last_mouse_pos
     try:
         point = ctypes.wintypes.POINT()
         if user32.GetCursorPos(ctypes.byref(point)):
             last_mouse_pos = {'x': point.x, 'y': point.y}
-        else: last_mouse_pos = {'x': screen_width // 2, 'y': screen_height // 2}
-    except Exception: last_mouse_pos = {'x': screen_width // 2, 'y': screen_height // 2}
+            print(f"[SocketIO] Initial mouse position: {last_mouse_pos}")
+        else:
+            last_mouse_pos = {'x': screen_width // 2, 'y': screen_height // 2}
+            print("[SocketIO] Could not get initial mouse position, using screen center.")
+    except Exception as e:
+        last_mouse_pos = {'x': screen_width // 2, 'y': screen_height // 2}
+        print(f"[SocketIO] Error getting initial mouse pos ({e}), using screen center.")
 
     try:
         sio.emit('register_client', {'token': ACCESS_PASSWORD})
@@ -302,14 +348,16 @@ def connect_error(data):
     print(f"[SocketIO] Connection failed: {data}", file=sys.stderr)
     is_connected_and_registered = False
 
+# FIX 1: Accept optional arguments
 @sio.event
-def disconnect():
+def disconnect(*args):
     global is_connected_and_registered
     print("[SocketIO] Disconnected from server.")
     is_connected_and_registered = False
+    # FIX 2: Use sio.reconnection
     # Signal capture thread to stop IF we are not automatically reconnecting
-    if not sio.reconnecting:
-         print("[SocketIO] Stopping capture thread due to disconnect.")
+    if not sio.reconnection:
+         print("[SocketIO] Stopping capture thread due to non-reconnecting disconnect.")
          stop_event.set()
 
 @sio.on('registration_success')
@@ -350,19 +398,33 @@ def handle_command(data):
     try:
         if action == 'move':
             x, y = data.get('x'), data.get('y')
-            if x is not None and y is not None: mouse_move_to(x, y, smooth=True)
+            if x is not None and y is not None:
+                # Scale coordinates received (likely 0-1) to screen dimensions
+                screen_x = x * screen_width
+                screen_y = y * screen_height
+                mouse_move_to(screen_x, screen_y, smooth=True)
         elif action == 'click':
             x, y = data.get('x'), data.get('y')
-            if x is not None and y is not None: mouse_move_to(x, y, smooth=False) # Instant move
+            # Scale coordinates
+            screen_x = x * screen_width
+            screen_y = y * screen_height
+            if x is not None and y is not None: mouse_move_to(screen_x, screen_y, smooth=False) # Instant move for click
             mouse_click(data.get('button', 'left'))
         elif action == 'keydown':
-            vk_code = get_vk_code(data.get('code', data.get('key')))
+            # Prefer 'code' if available (less ambiguous), fallback to 'key'
+            key_id = data.get('code', data.get('key'))
+            vk_code = get_vk_code(key_id)
             if vk_code: press_key(vk_code)
+            else: print(f"[Command] KeyDown: Unmapped key/code: {key_id}")
         elif action == 'keyup':
-            vk_code = get_vk_code(data.get('code', data.get('key')))
+            key_id = data.get('code', data.get('key'))
+            vk_code = get_vk_code(key_id)
             if vk_code: release_key(vk_code)
+            else: print(f"[Command] KeyUp: Unmapped key/code: {key_id}")
         elif action == 'scroll':
             dx, dy = data.get('dx', 0), data.get('dy', 0)
+            # Scale scroll values if needed, though often they are small pixel values
+            # For simplicity, assume dx/dy are intended scroll units/pixels for now
             if dx != 0 or dy != 0: mouse_scroll(dx=dx, dy=dy)
         # else: print(f"Unknown command action: {action}") # Reduce noise
     except Exception as e:
@@ -373,7 +435,7 @@ def handle_command(data):
 # --- Main Execution ---
 def main():
     global capture_thread, is_connected_and_registered
-    print("--- Remote Control Client (Optimized V2) ---")
+    print("--- Remote Control Client (Optimized V2 - Fixed) ---")
     print(f"Server URL: {SERVER_URL}")
     print(f"Screen: {screen_width}x{screen_height} | Target FPS: {FPS} | JPEG Quality: {JPEG_QUALITY}")
     print(f"Binary Mode: {SEND_BINARY_DATA} {'(Requires Server/JS Update!)' if SEND_BINARY_DATA else '(Using Base64)'}")
@@ -388,51 +450,63 @@ def main():
             print(f"[{time.strftime('%H:%M:%S')}] Attempting connection to {SERVER_URL}...")
             sio.connect(SERVER_URL,
                         transports=['websocket'], # Prioritize websockets
-                        wait_timeout=10)
+                        wait_timeout=10,
+                        namespaces=['/']) # Be explicit about namespace if server uses default
             # Blocks here until disconnected
-            print(f"[{time.strftime('%H:%M:%S')}] Connection active, waiting for events...")
+            print(f"[{time.strftime('%H:%M:%S')}] Connection appears active (sid: {sio.sid}), waiting for events...")
             sio.wait()
             # Reaches here when sio.disconnect() is called or connection drops
-            print(f"[{time.strftime('%H:%M:%S')}] sio.wait() finished (disconnected).")
+            print(f"[{time.strftime('%H:%M:%S')}] sio.wait() finished (likely disconnected).")
 
         except socketio.exceptions.ConnectionError as e:
             print(f"[{time.strftime('%H:%M:%S')}] Connection Error: {e}. Retrying soon...", file=sys.stderr)
-            # SocketIO handles background retries based on its settings.
-            # We add a delay here before the *next manual* attempt in the loop.
+            # SocketIO handles background retries based on its settings if reconnection=True (default).
+            # We add a delay here before the *next manual* attempt in the main loop.
             time.sleep(sio.reconnection_delay)
         except Exception as e:
              print(f"[{time.strftime('%H:%M:%S')}] Unexpected error in connection loop: {e}", file=sys.stderr)
              traceback.print_exc(file=sys.stderr)
+             # Ensure state is reset
+             is_connected_and_registered = False
+             if sio.connected:
+                 try:
+                    sio.disconnect()
+                 except Exception: pass # Ignore errors during forced disconnect
              time.sleep(sio.reconnection_delay) # Wait before next manual attempt
 
         # --- Post-Disconnect / Error Handling ---
         is_connected_and_registered = False # Ensure flag is false after disconnect/error
 
         # Check if SocketIO is still attempting to reconnect internally
-        if sio.reconnecting:
+        # FIX 3: Use sio.reconnection
+        if sio.reconnection:
             print(f"[{time.strftime('%H:%M:%S')}] SocketIO attempting background reconnection...")
-            while sio.reconnecting and not stop_event.is_set():
-                 time.sleep(0.5)
+            # FIX 4: Use sio.reconnection
+            while sio.reconnection and not stop_event.is_set():
+                 time.sleep(0.5) # Wait for internal attempts
             if sio.connected:
-                 print(f"[{time.strftime('%H:%M:%S')}] Background reconnection successful!")
-                 # Need to re-register after background reconnect
+                 print(f"[{time.strftime('%H:%M:%S')}] Background reconnection successful! Re-registering...")
+                 # Need to re-register after background reconnect. Loop continues.
                  continue # Go to top of loop to attempt registration etc.
             else:
                  print(f"[{time.strftime('%H:%M:%S')}] Background reconnection failed.")
 
-        # Ensure capture thread is stopped if not connected and not reconnecting
-        if capture_thread and capture_thread.is_alive():
+        # Ensure capture thread is stopped if not connected and not attempting reconnection
+        # FIX 5: Use sio.reconnection
+        if not sio.connected and not sio.reconnection and capture_thread and capture_thread.is_alive():
              print(f"[{time.strftime('%H:%M:%S')}] Ensuring capture thread is stopped...")
-             stop_event.set()
-             capture_thread.join(timeout=2.0)
+             stop_event.set() # Signal thread to stop
+             capture_thread.join(timeout=2.0) # Wait for it
              if capture_thread.is_alive():
                  print(f"[{time.strftime('%H:%M:%S')}] Warning: Capture thread did not stop gracefully.", file=sys.stderr)
-             capture_thread = None
-             stop_event.clear() # Clear for the next connection attempt
+             capture_thread = None # Clear thread variable
+             stop_event.clear() # Clear stop flag for the next connection attempt
 
         # Wait before the next manual connection attempt in the loop
         if not stop_event.is_set():
-            wait_time = max(0, sio.reconnection_delay - (time.monotonic() - connect_attempt_time))
+            # Calculate how long to wait, considering time already spent in this loop iteration
+            elapsed_since_attempt = time.monotonic() - connect_attempt_time
+            wait_time = max(0.1, sio.reconnection_delay - elapsed_since_attempt) # Ensure minimum wait
             print(f"[{time.strftime('%H:%M:%S')}] Waiting {wait_time:.1f}s before next connection attempt...")
             time.sleep(wait_time)
 
@@ -449,12 +523,14 @@ if __name__ == '__main__':
         stop_event.set()
     finally:
         print(f"[{time.strftime('%H:%M:%S')}] --- Final Client Cleanup ---")
-        stop_event.set() # Ensure stop is signaled
+        stop_event.set() # Ensure stop is signaled again
 
         if sio and sio.connected:
             print(f"[{time.strftime('%H:%M:%S')}] Disconnecting SocketIO...")
-            try: sio.disconnect()
-            except Exception as e: print(f"Error during final disconnect: {e}", file=sys.stderr)
+            try:
+                sio.disconnect()
+            except Exception as e:
+                print(f"Error during final disconnect: {e}", file=sys.stderr)
 
         if capture_thread and capture_thread.is_alive():
              print(f"[{time.strftime('%H:%M:%S')}] Waiting for capture thread final exit...")
@@ -465,5 +541,4 @@ if __name__ == '__main__':
         print(f"[{time.strftime('%H:%M:%S')}] Client shutdown complete.")
         print("--------------------------------")
         # Use os._exit for a more forceful exit if threads are stuck
-        # sys.exit(0)
         os._exit(0)
